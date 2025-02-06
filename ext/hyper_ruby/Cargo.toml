@@ -1,0 +1,17 @@
+[package]
+name = "hyper_ruby"
+version = "0.1.0"
+edition = "2021"
+authors = ["alistairjevans <alistair@betterstack.com>"]
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = { version = "0.6.2" }
+hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full", "tokio"] }

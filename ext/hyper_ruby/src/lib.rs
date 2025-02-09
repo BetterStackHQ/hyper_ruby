@@ -84,7 +84,8 @@ impl Server {
                  match work_request {
                     Ok(work_request) => {
                         // Call the Ruby block and handle the response
-                        let warp_response = match block.call::<_, Value>((work_request.request,)) {
+                        let req_ref = Obj::wrap(work_request.request);
+                        let warp_response = match block.call::<_, Value>([req_ref]) {
                             Ok(result) => {
                                 let ref_response = Obj::<Response>::try_convert(result).unwrap();
 
@@ -148,8 +149,6 @@ impl Server {
             .build()
             .map_err(|e| MagnusError::new(magnus::exception::runtime_error(), e.to_string()))?;
 
-        println!("Starting server");
-        
         rt.block_on(async {
             let work_tx = work_tx.clone();
             

@@ -4,7 +4,7 @@ use warp::http::HeaderMap;
 
 // Type passed to ruby giving access to the request properties.
 #[derive(Debug)]
-#[magnus::wrap(class = "HyperRuby::Request")]
+#[magnus::wrap(class = "HyperRuby::Request", free_immediately)]
 pub struct Request {
     pub method: warp::http::Method,
     pub path: String,

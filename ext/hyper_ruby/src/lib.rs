@@ -1,13 +1,16 @@
+mod request;
+mod response;
+mod gvl_helpers;
+
+use request::Request;
+use response::Response;
+use gvl_helpers::nogvl;
+
 use magnus::block::block_proc;
 use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
-use magnus::value::{qnil, Opaque};
-use magnus::{function, gc, method, prelude::*, DataTypeFunctions, Error as MagnusError, RString, Ruby, TypedData, Value};
+use magnus::{function, method, prelude::*, Error as MagnusError, Ruby, Value};
 use bytes::Bytes;
-
-use std::{ffi::c_void, mem::MaybeUninit, ptr::null_mut};
-
-use rb_sys::rb_thread_call_without_gvl;
 
 use warp::Filter;
 use warp::http::Response as WarpResponse;
@@ -35,82 +38,11 @@ impl ServerConfig {
     }
 }
 
+// Sent on the work channel with the request, and a oneshot channel to send the response back on.
 struct RequestWithCompletion {
     request: Request,
     // sent a response back on this thread
     response_tx: oneshot::Sender<WarpResponse<Bytes>>,
-}
-
-// Request type that will be sent to worker threads
-#[derive(Debug)]
-#[magnus::wrap(class = "HyperRuby::Request")]
-struct Request {
-    method: warp::http::Method,
-    path: String,
-    headers: warp::http::HeaderMap,
-    body: Bytes,
-}
-
-impl Request {
-    pub fn method(&self) -> String {
-        self.method.to_string()
-    }
-
-    pub fn path(&self) -> RString {
-        RString::new(&self.path)
-    }
-
-    pub fn header(&self, key: String) -> Value {
-        match self.headers.get(key) {
-            Some(value) => match value.to_str() {
-                Ok(value) => RString::new(value).as_value(),
-                Err(_) => qnil().as_value(),
-            },
-            None => qnil().as_value(),
-        }
-    }
-
-    pub fn body_size(&self) -> usize {
-        self.body.len()
-    }
-
-    pub fn body(&self) -> Value {
-        if self.body.is_empty() {
-            return qnil().as_value();
-        }
-
-        let result = RString::buf_new(self.body_size());
-
-        // cat to the end of the string directly from the byte buffer
-        result.cat(self.body.as_ref());
-        result.as_value()
-    }
-}
-
-
-#[derive(TypedData)]
-#[magnus(class = "HyperRuby::Response", mark)]
-struct Response {
-    status: u16,
-    headers: Opaque<magnus::RHash>,
-    body: Opaque<magnus::RString>,
-}
-
-impl DataTypeFunctions for Response {
-    fn mark(&self, marker: &gc::Marker) {
-        marker.mark(self.headers);
-        marker.mark(self.body);
-    }
-}
-
-impl Response {
-    pub fn new(status: u16, headers: magnus::RHash, body: RString) -> Self {
-        Self {
-            status,
-            headers: headers.into(),
-            body: body.into(),
-        }
-    }
 }
 
 #[magnus::wrap(class = "HyperRuby::Server")]
@@ -119,30 +51,6 @@ struct Server {
     config: RefCell<ServerConfig>,
     work_rx: RefCell<Option<crossbeam_channel::Receiver<RequestWithCompletion>>>,
     work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<RequestWithCompletion>>>>,
-}
-
-
-pub(crate) fn nogvl<F, R>(mut func: F) -> R
-where
-    F: FnMut() -> R,
-    R: Sized,
-{
-    unsafe extern "C" fn call_without_gvl<F, R>(arg: *mut c_void) -> *mut c_void
-    where
-        F: FnMut() -> R,
-        R: Sized,
-    {
-        let arg = arg as *mut (&mut F, &mut MaybeUninit<R>);
-        let (func, result) = unsafe { &mut *arg };
-        result.write(func());
-        null_mut()
-    }
-    let result = MaybeUninit::uninit();
-    let arg_ptr = &(&mut func, &result) as *const _ as *mut c_void;
-    unsafe {
-        rb_thread_call_without_gvl(Some(call_without_gvl::<F, R>), arg_ptr, None, null_mut());
-        result.assume_init()
-    }
 }
 
 impl Server {

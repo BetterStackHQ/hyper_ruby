@@ -1,18 +1,13 @@
 use magnus::block::block_proc;
 use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
-use magnus::value::{InnerValue, Opaque};
-use magnus::{block, function, gc, method, prelude::*, DataTypeFunctions, Error as MagnusError, RClass, RObject, RString, RTypedData, Ruby, TypedData, Value};
+use magnus::value::Opaque;
+use magnus::{function, gc, method, prelude::*, DataTypeFunctions, Error as MagnusError, RString, Ruby, TypedData, Value};
 use bytes::Bytes;
 
-use std::ops::Deref;
-use std::os::unix::raw::uid_t;
-use std::{cell::Cell, ffi::c_void, marker::PhantomData, mem::MaybeUninit, ptr::null_mut};
+use std::{ffi::c_void, mem::MaybeUninit, ptr::null_mut};
 
-use rb_sys::{
-    rb_gc_guard, rb_str_locktmp, rb_str_modify_expand, rb_str_set_len, rb_str_unlocktmp,
-    rb_thread_call_without_gvl, RSTRING_PTR,
-};
+use rb_sys::rb_thread_call_without_gvl;
 
 use warp::Filter;
 use warp::http::Response as WarpResponse;

@@ -11,3 +11,5 @@ gem "rake-compiler"
 gem "rb_sys", "~> 0.9.63"
 
 gem "minitest", "~> 5.16"
+
+gem "httpx", "~> 1.4"

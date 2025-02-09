@@ -6,6 +6,9 @@ PATH
 GEM
   remote: https://rubygems.org/
   specs:
+    http-2 (1.0.2)
+    httpx (1.4.0)
+      http-2 (>= 1.0.0)
     minitest (5.25.4)
     rake (13.2.1)
     rake-compiler (1.2.9)
@@ -19,6 +22,7 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
+  httpx (~> 1.4)
   hyper_ruby!
   minitest (~> 5.16)
   rake (~> 13.0)

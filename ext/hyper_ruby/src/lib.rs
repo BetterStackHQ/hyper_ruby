@@ -1,7 +1,7 @@
 use magnus::block::block_proc;
 use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
-use magnus::value::Opaque;
+use magnus::value::{qnil, Opaque};
 use magnus::{function, gc, method, prelude::*, DataTypeFunctions, Error as MagnusError, RString, Ruby, TypedData, Value};
 use bytes::Bytes;
 
@@ -35,15 +35,56 @@ impl ServerConfig {
     }
 }
 
+struct RequestWithCompletion {
+    request: Request,
+    // sent a response back on this thread
+    response_tx: oneshot::Sender<WarpResponse<Bytes>>,
+}
+
 // Request type that will be sent to worker threads
 #[derive(Debug)]
-struct WorkRequest {
+#[magnus::wrap(class = "HyperRuby::Request")]
+struct Request {
     method: warp::http::Method,
     path: String,
     headers: warp::http::HeaderMap,
     body: Bytes,
-    // sent a response back on this thread
-    response_tx: oneshot::Sender<WarpResponse<Vec<u8>>>,
+}
+
+impl Request {
+    pub fn method(&self) -> String {
+        self.method.to_string()
+    }
+
+    pub fn path(&self) -> RString {
+        RString::new(&self.path)
+    }
+
+    pub fn header(&self, key: String) -> Value {
+        match self.headers.get(key) {
+            Some(value) => match value.to_str() {
+                Ok(value) => RString::new(value).as_value(),
+                Err(_) => qnil().as_value(),
+            },
+            None => qnil().as_value(),
+        }
+    }
+
+    pub fn body_size(&self) -> usize {
+        self.body.len()
+    }
+
+    pub fn body(&self) -> Value {
+        if self.body.is_empty() {
+            return qnil().as_value();
+        }
+
+        let result = RString::buf_new(self.body_size());
+
+        // cat to the end of the string directly from the byte buffer
+        result.cat(self.body.as_ref());
+        result.as_value()
+    }
 }
 
 
@@ -76,8 +117,8 @@ impl Response {
 struct Server {
     server_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     config: RefCell<ServerConfig>,
-    work_rx: RefCell<Option<crossbeam_channel::Receiver<WorkRequest>>>,
-    work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<WorkRequest>>>>,
+    work_rx: RefCell<Option<crossbeam_channel::Receiver<RequestWithCompletion>>>,
+    work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<RequestWithCompletion>>>>,
 }
 
 
@@ -134,30 +175,12 @@ impl Server {
                 
                  match work_request {
                     Ok(work_request) => {
-                        
-                        // Create Ruby hash with request data
-                        let req_hash = magnus::RHash::new();
-                        req_hash.aset(magnus::Symbol::new("method"), work_request.method.to_string())?;
-                        req_hash.aset(magnus::Symbol::new("path"), work_request.path)?;
-                        
-                        // Convert headers to Ruby hash
-                        let headers_hash = magnus::RHash::new();
-                        for (key, value) in work_request.headers.iter() {
-                            if let Ok(value_str) = value.to_str() {
-                                headers_hash.aset(key.as_str(), value_str)?;
-                            }
-                        }
-                        req_hash.aset(magnus::Symbol::new("headers"), headers_hash)?;
-                        
-                        // Convert body to Ruby string
-                        req_hash.aset(magnus::Symbol::new("body"), magnus::RString::from_slice(&work_request.body[..]))?;
-                            
                         // Call the Ruby block and handle the response
-                        let warp_response = match block.call::<_, Value>([req_hash]) {
+                        let warp_response = match block.call::<_, Value>((work_request.request,)) {
                             Ok(result) => {
                                 let ref_response = Obj::<Response>::try_convert(result).unwrap();
 
-                                let mut response: WarpResponse<Vec<u8>>;
+                                let mut response: WarpResponse<Bytes>;
                                 let ruby = Ruby::get().unwrap(); // errors on non-Ruby thread
                                 let response_body = ruby.get_inner(ref_response.body);
                                 let ruby_response_headers = ruby.get_inner(ref_response.headers);
@@ -165,8 +188,7 @@ impl Server {
                                 // safe because RString will not be cleared here before we copy the bytes into our own Vector.
                                 unsafe {
                                     // copy directly to bytes here so we don't have to worry about encoding checks
-                                    let rust_body = Vec::from(response_body.as_slice());
-                                    
+                                    let rust_body = Bytes::copy_from_slice(response_body.as_slice());
                                     response = WarpResponse::new(rust_body);
                                 }
 
@@ -287,8 +309,8 @@ impl Server {
 
 
 // Helper function to create error responses
-fn create_error_response(error_message: &str) -> WarpResponse<Vec<u8>> {
-    let mut response = WarpResponse::new(format!(r#"{{"error": "{}"}}"#, error_message).into_bytes());
+fn create_error_response(error_message: &str) -> WarpResponse<Bytes> {
+    let mut response = WarpResponse::new(Bytes::from(format!(r#"{{"error": "{}"}}"#, error_message)));
     *response.status_mut() = warp::http::StatusCode::INTERNAL_SERVER_ERROR;
     response.headers_mut().insert(
         warp::http::header::CONTENT_TYPE,
@@ -302,19 +324,23 @@ async fn handle_request(
     path: warp::path::FullPath,
     headers: warp::http::HeaderMap,
     body: Bytes,
-    work_tx: Arc<crossbeam_channel::Sender<WorkRequest>>,
-) -> Result<WarpResponse<Vec<u8>>, warp::Rejection> {
+    work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
+) -> Result<WarpResponse<Bytes>, warp::Rejection> {
     let (response_tx, response_rx) = oneshot::channel();
 
-    let work_request = WorkRequest {
+    let request = Request {
         method,
         path: path.as_str().to_string(),
         headers,
-        body,
+        body
+    };
+
+    let with_completion = RequestWithCompletion {
+        request,
         response_tx,
     };
 
-    if let Err(_) = work_tx.send(work_request) {
+    if let Err(_) = work_tx.send(with_completion) {
         return Err(warp::reject::reject());
     }
 
@@ -337,6 +363,13 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
 
     let response_class = module.define_class("Response", ruby.class_object())?;
     response_class.define_singleton_method("new", function!(Response::new, 3))?;
+
+    let request_class = module.define_class("Request", ruby.class_object())?;
+    request_class.define_method("http_method", method!(Request::method, 0))?;
+    request_class.define_method("path", method!(Request::path, 0))?;
+    request_class.define_method("header", method!(Request::header, 1))?;
+    request_class.define_method("body", method!(Request::body, 0))?;
+    request_class.define_method("body_size", method!(Request::body_size, 0))?;
 
     Ok(())
 }

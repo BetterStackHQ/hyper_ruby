@@ -9,7 +9,7 @@ use gvl_helpers::nogvl;
 use magnus::block::block_proc;
 use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
-use magnus::{function, method, prelude::*, Error as MagnusError, Ruby, Value};
+use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value};
 use bytes::Bytes;
 
 use warp::Filter;
@@ -83,9 +83,8 @@ impl Server {
                 
                  match work_request {
                     Ok(work_request) => {
-                        // Call the Ruby block and handle the response
-                        let req_ref = Obj::wrap(work_request.request);
-                        let warp_response = match block.call::<_, Value>([req_ref]) {
+                        let value = unsafe { work_request.request.into_value_unchecked() };
+                        let warp_response = match block.call::<_, Value>([value]) {
                             Ok(result) => {
                                 let ref_response = Obj::<Response>::try_convert(result).unwrap();
 

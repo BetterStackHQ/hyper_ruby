@@ -35,11 +35,11 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  def test_blocking
-    with_server(-> (request) { handler_simple(request) }) do |client|
-      gets
-    end
-  end
+  # def test_blocking
+  #   with_server(-> (request) { handler_simple(request) }) do |client|
+  #     gets
+  #   end
+  # end
 
   def with_server(request_handler, &block)
     server = HyperRuby::Server.new
@@ -66,7 +66,7 @@ class TestHyperRuby < Minitest::Test
   end
 
   def handler_simple(request)
-    HyperRuby::Response.new(200, { 'Content-Type' => 'text/plain' }, "ABC")
+    HyperRuby::Response.new(200, { 'Content-Type' => 'text/plain' }, request.http_method)
   end
 
   def handler_to_json(request)

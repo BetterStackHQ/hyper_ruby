@@ -51,6 +51,7 @@ struct Server {
     config: RefCell<ServerConfig>,
     work_rx: RefCell<Option<crossbeam_channel::Receiver<RequestWithCompletion>>>,
     work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<RequestWithCompletion>>>>,
+    runtime: RefCell<Option<Arc<tokio::runtime::Runtime>>>,
 }
 
 impl Server {
@@ -62,6 +63,7 @@ impl Server {
             config: RefCell::new(ServerConfig::new()),
             work_rx: RefCell::new(Some(work_rx)),
             work_tx: RefCell::new(Some(Arc::new(work_tx))),
+            runtime: RefCell::new(None),
         }
     }
 
@@ -143,10 +145,13 @@ impl Server {
             .ok_or_else(|| MagnusError::new(magnus::exception::runtime_error(), "Work channel not initialized"))?
             .clone();
  
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        let rt = Arc::new(tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| MagnusError::new(magnus::exception::runtime_error(), e.to_string()))?;
+            .map_err(|e| MagnusError::new(magnus::exception::runtime_error(), e.to_string()))?);
+
+        // Store the runtime
+        *self.runtime.borrow_mut() = Some(rt.clone());
 
         rt.block_on(async {
             let work_tx = work_tx.clone();
@@ -167,7 +172,7 @@ impl Server {
                     let incoming = UnixListenerStream::new(listener);
                     warp::serve(any_route)
                         .run_incoming(incoming)
-                        .await
+                        .await;
                 } else {
                     let addr: SocketAddr = config.bind_address.parse()
                         .expect("invalid address format");
@@ -183,31 +188,31 @@ impl Server {
             Ok::<(), MagnusError>(())
         })?;
 
-        // Keep the runtime alive
-        std::thread::spawn(move || {
-            rt.block_on(async {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            });
-        });
-
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), MagnusError> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| MagnusError::new(magnus::exception::runtime_error(), e.to_string()))?;
+        // Use the stored runtime instead of creating a new one
+        if let Some(rt) = self.runtime.borrow().as_ref() {
+            rt.block_on(async {
+                let mut handle = self.server_handle.lock().await;
+                if let Some(task) = handle.take() {
+                    task.abort();
+                }
+            });
+        }
 
-        rt.block_on(async {
-            let mut handle = self.server_handle.lock().await;
-            if let Some(task) = handle.take() {
-                task.abort();
-            }
-        });
-
-        // Drop the channel to signal workers to shut down
+        // Drop the channel and runtime
         self.work_tx.borrow_mut().take();
+        self.runtime.borrow_mut().take();
+
+        let bind_address = self.config.borrow().bind_address.clone();
+        if bind_address.starts_with("unix:") {
+            let path = bind_address.trim_start_matches("unix:");
+            std::fs::remove_file(path).unwrap_or_else(|e| {
+                println!("Failed to remove socket file: {:?}", e);
+            });
+        }
 
         Ok(())
     }

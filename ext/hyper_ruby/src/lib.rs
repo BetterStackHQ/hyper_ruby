@@ -23,11 +23,11 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use crossbeam_channel;
 
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Error, Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto;
 use http_body_util::BodyExt; // You'll need this
 use http_body_util::Full;
 
@@ -177,20 +177,10 @@ impl Server {
 
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
-                        let io = TokioIo::new(stream);
                         let work_tx = work_tx.clone();
 
                         tokio::task::spawn(async move {
-                            let service = service_fn(move |req: HyperRequest<Incoming>| {
-                                let work_tx = work_tx.clone();
-                                handle_request(req, work_tx)
-                            });
-
-                            if let Err(err) = http1::Builder::new()
-                                .serve_connection(io, service)
-                                .await {
-                                eprintln!("Error serving connection: {:?}", err);
-                            }
+                            handle_connection(stream, work_tx).await;
                         });
                     }
                 } else {
@@ -200,20 +190,10 @@ impl Server {
 
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
-                        let io = TokioIo::new(stream);
                         let work_tx = work_tx.clone();
 
                         tokio::task::spawn(async move {
-                            let service = service_fn(move |req: HyperRequest<Incoming>| {
-                                let work_tx = work_tx.clone();
-                                handle_request(req, work_tx)
-                            });
-
-                            if let Err(err) = http1::Builder::new()
-                                .serve_connection(io, service)
-                                .await {
-                                eprintln!("Error serving connection: {:?}", err);
-                            }
+                            handle_connection(stream, work_tx).await;
                         });
                     }
                 }
@@ -291,6 +271,25 @@ async fn handle_request(
     match response_rx.await {
         Ok(response) => { Ok(response) }        
         Err(_) => Ok(create_error_response("Failed to get response")),
+    }
+}
+
+async fn handle_connection(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
+) {
+    let service = service_fn(move |req: HyperRequest<Incoming>| {
+        let work_tx = work_tx.clone();
+        handle_request(req, work_tx)
+    });
+
+    let io = TokioIo::new(stream);
+    
+    if let Err(err) = auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .serve_connection(io, service)
+        .await
+    {
+        eprintln!("Error serving connection: {:?}", err);
     }
 }
 

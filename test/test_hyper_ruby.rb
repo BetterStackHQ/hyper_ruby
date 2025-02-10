@@ -51,11 +51,11 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  # def test_blocking
-  #   with_server(-> (request) { handler_simple(request) }) do |client|
-  #     gets
-  #   end
-  # end
+  def test_blocking
+    with_server(-> (request) { handler_simple(request) }) do |client|
+      gets
+    end
+  end
 
   def with_server(request_handler, &block)
     server = HyperRuby::Server.new

@@ -2,6 +2,7 @@ mod request;
 mod response;
 mod gvl_helpers;
 
+use hyper::header::HeaderName;
 use request::Request;
 use response::Response;
 use gvl_helpers::nogvl;
@@ -12,18 +13,23 @@ use magnus::typed_data::Obj;
 use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value};
 use bytes::Bytes;
 
-use warp::Filter;
-use warp::http::Response as WarpResponse;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 
 use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
 
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use crossbeam_channel;
+
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Error, Request as HyperRequest, Response as HyperResponse, StatusCode};
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
+use http_body_util::BodyExt; // You'll need this
+use http_body_util::Full;
 
 #[derive(Clone)]
 struct ServerConfig {
@@ -42,7 +48,7 @@ impl ServerConfig {
 struct RequestWithCompletion {
     request: Request,
     // sent a response back on this thread
-    response_tx: oneshot::Sender<WarpResponse<Bytes>>,
+    response_tx: oneshot::Sender<HyperResponse<Full<Bytes>>>,
 }
 
 #[magnus::wrap(class = "HyperRuby::Server")]
@@ -86,44 +92,53 @@ impl Server {
                  match work_request {
                     Ok(work_request) => {
                         let value = unsafe { work_request.request.into_value_unchecked() };
-                        let warp_response = match block.call::<_, Value>([value]) {
+                        let hyper_response = match block.call::<_, Value>([value]) {
                             Ok(result) => {
                                 let ref_response = Obj::<Response>::try_convert(result).unwrap();
 
-                                let mut response: WarpResponse<Bytes>;
-                                let ruby = Ruby::get().unwrap(); // errors on non-Ruby thread
-                                let response_body = ruby.get_inner(ref_response.body);
-                                let ruby_response_headers = ruby.get_inner(ref_response.headers);
-                                
-                                // safe because RString will not be cleared here before we copy the bytes into our own Vector.
-                                unsafe {
-                                    // copy directly to bytes here so we don't have to worry about encoding checks
-                                    let rust_body = Bytes::copy_from_slice(response_body.as_slice());
-                                    response = WarpResponse::new(rust_body);
-                                }
+                                let mut builder = HyperResponse::builder()
+                                    .status(ref_response.status);
 
-                                *response.status_mut() = warp::http::StatusCode::from_u16(ref_response.status).unwrap();
-                                let response_headers = response.headers_mut();
-                                
+                                // safe because the block result will only ever be called on the ruby thread
+                                let ruby = unsafe { Ruby::get_unchecked() };
+
+                                let ruby_response_headers = ruby.get_inner(ref_response.headers);
+                                let builder_headers = builder.headers_mut().unwrap();
                                 ruby_response_headers.foreach(|key: String, value: String| {
-                                    if let Ok(header_name) = warp::http::header::HeaderName::from_bytes(key.as_bytes()) {
-                                        response_headers.insert(header_name, warp::http::HeaderValue::from_str(&value).unwrap());
-                                    }
-                                    else {
-                                        MagnusError::new(magnus::exception::runtime_error(), "Invalid header name");
-                                    }
+                                    let header_name = HeaderName::try_from(key).unwrap();
+                                    builder_headers.insert(header_name, value.try_into().unwrap());
                                     Ok(ForEach::Continue)
                                 }).unwrap();
 
-                                response
+                                let response_body = ruby.get_inner(ref_response.body);
+                                let response: Result<HyperResponse<Full<Bytes>>, hyper::http::Error>;
+
+                                if response_body.len() > 0 {
+                                    // safe because RString will not be cleared here before we copy the bytes into our own Vector.
+                                    unsafe {
+                                        // copy directly to bytes here so we don't have to worry about encoding checks
+                                        let rust_body = Bytes::copy_from_slice(response_body.as_slice());
+                                        response = builder.body(Full::new(rust_body));
+                                    }
+                                } else {
+                                    response = builder.body(Full::new(Bytes::new()));
+                                }
+
+                                match response {
+                                    Ok(response) => response,
+                                    Err(e) => {
+                                        println!("HTTP request build failed {:?}", e);
+                                        create_error_response("Internal server error")
+                                    }
+                                }
                             },
                             Err(e) => {
                                 println!("Block call failed: {:?}", e);
-                                create_error_response("Block call failed")
+                                create_error_response("Internal server error")
                             }
                         };
 
-                        match work_request.response_tx.send(warp_response) {
+                        match work_request.response_tx.send(hyper_response) {
                             Ok(_) => (),
                             Err(e) => println!("Failed to send response: {:?}", e),
                         }
@@ -150,35 +165,57 @@ impl Server {
             .build()
             .map_err(|e| MagnusError::new(magnus::exception::runtime_error(), e.to_string()))?);
 
-        // Store the runtime
         *self.runtime.borrow_mut() = Some(rt.clone());
 
         rt.block_on(async {
             let work_tx = work_tx.clone();
             
             let server_task = tokio::spawn(async move {
-                let any_route = warp::any()
-                    .and(warp::filters::method::method())
-                    .and(warp::filters::path::full())
-                    .and(warp::header::headers_cloned())
-                    .and(warp::body::bytes())
-                    .and(warp::any().map(move || work_tx.clone()))
-                    .and_then(handle_request);
-
                 if config.bind_address.starts_with("unix:") {
                     let path = config.bind_address.trim_start_matches("unix:");
-                
                     let listener = UnixListener::bind(path).unwrap();
-                    let incoming = UnixListenerStream::new(listener);
-                    warp::serve(any_route)
-                        .run_incoming(incoming)
-                        .await;
+
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let io = TokioIo::new(stream);
+                        let work_tx = work_tx.clone();
+
+                        tokio::task::spawn(async move {
+                            let service = service_fn(move |req: HyperRequest<Incoming>| {
+                                let work_tx = work_tx.clone();
+                                handle_request(req, work_tx)
+                            });
+
+                            if let Err(err) = http1::Builder::new()
+                                .serve_connection(io, service)
+                                .await {
+                                eprintln!("Error serving connection: {:?}", err);
+                            }
+                        });
+                    }
                 } else {
                     let addr: SocketAddr = config.bind_address.parse()
                         .expect("invalid address format");
-                    warp::serve(any_route)
-                        .run(addr)
-                        .await;
+                    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let io = TokioIo::new(stream);
+                        let work_tx = work_tx.clone();
+
+                        tokio::task::spawn(async move {
+                            let service = service_fn(move |req: HyperRequest<Incoming>| {
+                                let work_tx = work_tx.clone();
+                                handle_request(req, work_tx)
+                            });
+
+                            if let Err(err) = http1::Builder::new()
+                                .serve_connection(io, service)
+                                .await {
+                                eprintln!("Error serving connection: {:?}", err);
+                            }
+                        });
+                    }
                 }
             });
 
@@ -220,44 +257,40 @@ impl Server {
 
 
 // Helper function to create error responses
-fn create_error_response(error_message: &str) -> WarpResponse<Bytes> {
-    let mut response = WarpResponse::new(Bytes::from(format!(r#"{{"error": "{}"}}"#, error_message)));
-    *response.status_mut() = warp::http::StatusCode::INTERNAL_SERVER_ERROR;
-    response.headers_mut().insert(
-        warp::http::header::CONTENT_TYPE,
-        warp::http::HeaderValue::from_static("application/json")
-    );
-    response
+fn create_error_response(error_message: &str) -> HyperResponse<Full<Bytes>> {
+    HyperResponse::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(format!(r#"{{"error": "{}"}}"#, error_message))))
+        .unwrap()
 }
 
 async fn handle_request(
-    method: warp::http::Method,
-    path: warp::path::FullPath,
-    headers: warp::http::HeaderMap,
-    body: Bytes,
+    req: HyperRequest<Incoming>,
     work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
-) -> Result<WarpResponse<Bytes>, warp::Rejection> {
-    let (response_tx, response_rx) = oneshot::channel();
+) -> Result<HyperResponse<Full<Bytes>>, Error> {
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = body.collect().await?.to_bytes();
 
     let request = Request {
-        method,
-        path: path.as_str().to_string(),
-        headers,
-        body
+        request: HyperRequest::from_parts(parts, body_bytes),
     };
+
+    let (response_tx, response_rx) = oneshot::channel();
 
     let with_completion = RequestWithCompletion {
         request,
         response_tx,
     };
 
-    if let Err(_) = work_tx.send(with_completion) {
-        return Err(warp::reject::reject());
+    if work_tx.send(with_completion).is_err() {
+        return Ok(create_error_response("Failed to process request"));
     }
 
     match response_rx.await {
-        Ok(response) => Ok(response),
-        Err(_) => Err(warp::reject::reject()),
+        Ok(response) => { Ok(response) }        
+        Err(_) => Ok(create_error_response("Failed to get response")),
     }
 }
 

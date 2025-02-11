@@ -42,4 +42,11 @@ impl Request {
         result.cat(body.as_ref());
         result.as_value()
     }
+
+    pub fn inspect(&self) -> RString {
+        let method = self.request.method().to_string();
+        let path = self.request.uri().path();
+        let body_size = self.request.body().len();
+        RString::new(&format!("#<HyperRuby::Request method={} path={} body_size={}>", method, path, body_size))
+    }
 } 

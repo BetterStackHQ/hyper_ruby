@@ -313,6 +313,7 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     request_class.define_method("header", method!(Request::header, 1))?;
     request_class.define_method("body", method!(Request::body, 0))?;
     request_class.define_method("body_size", method!(Request::body_size, 0))?;
+    request_class.define_method("inspect", method!(Request::inspect, 0))?;
 
     Ok(())
 }

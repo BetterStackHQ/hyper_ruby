@@ -2,6 +2,7 @@ use std::{ffi::c_void, mem::MaybeUninit, ptr::null_mut};
 use rb_sys::rb_thread_call_without_gvl;
 
 // Call a specified function, having released the GVL. Acquires the GVL before returning.
+// Credit to https://github.com/Shopify/lz4-flex-rb for this one.
 pub(crate) fn nogvl<F, R>(mut func: F) -> R
 where
     F: FnMut() -> R,

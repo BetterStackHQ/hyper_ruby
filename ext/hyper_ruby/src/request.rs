@@ -18,8 +18,10 @@ impl Request {
         RString::new(&self.request.uri().path())
     }
 
-    pub fn header(&self, key: String) -> Value {
-        match self.request.headers().get(key) {
+    pub fn header(&self, key: RString) -> Value {
+        // Avoid allocating a new header key string
+        let key_str = unsafe { key.as_str().unwrap() };
+        match self.request.headers().get(key_str) {
             Some(value) => match value.to_str() {
                 Ok(value) => RString::new(value).as_value(),
                 Err(_) => qnil().as_value(),

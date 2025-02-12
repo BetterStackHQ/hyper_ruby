@@ -17,6 +17,14 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
+  def test_header_fetch_get
+    with_server(-> (request) { handler_return_header(request, 'User-Agent') }) do |client|
+      response = client.get("/", headers: { 'User-Agent' => 'test' })
+      assert_equal 200, response.status
+      assert_equal "test", JSON.parse(response.body)["message"]
+    end
+  end
+
   def test_simple_post
     with_server(-> (request) { handler_to_json(request) }) do |client|
       response = client.post("/", body: "Hello")
@@ -112,5 +120,10 @@ class TestHyperRuby < Minitest::Test
 
   def handler_to_json(request)
     HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.body }.to_json)
+  end
+  
+
+  def handler_return_header(request, header_key)
+    HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.header(header_key) }.to_json)
   end
 end

@@ -34,12 +34,14 @@ use http_body_util::Full;
 #[derive(Clone)]
 struct ServerConfig {
     bind_address: String,
+    tokio_threads: Option<usize>,
 }
 
 impl ServerConfig {
     fn new() -> Self {
         Self {
             bind_address: String::from("127.0.0.1:3000"),
+            tokio_threads: None,
         }
     }
 }
@@ -78,6 +80,11 @@ impl Server {
         if let Some(bind_address) = config.get(magnus::Symbol::new("bind_address")) {
             server_config.bind_address = String::try_convert(bind_address)?;
         }
+
+        if let Some(tokio_threads) = config.get(magnus::Symbol::new("tokio_threads")) {
+            server_config.tokio_threads = Some(usize::try_convert(tokio_threads)?);
+        }
+
         Ok(())
     }
 
@@ -163,9 +170,16 @@ impl Server {
             .as_ref()
             .ok_or_else(|| MagnusError::new(magnus::exception::runtime_error(), "Work channel not initialized"))?
             .clone();
- 
-        let rt = Arc::new(tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
+
+        let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+            
+        rt_builder.enable_all();
+
+        if let Some(tokio_threads) = config.tokio_threads {
+            rt_builder.worker_threads(tokio_threads);
+        }
+
+        let rt = Arc::new(rt_builder
             .build()
             .map_err(|e| MagnusError::new(magnus::exception::runtime_error(), e.to_string()))?);
 
@@ -311,6 +325,7 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     request_class.define_method("http_method", method!(Request::method, 0))?;
     request_class.define_method("path", method!(Request::path, 0))?;
     request_class.define_method("header", method!(Request::header, 1))?;
+    request_class.define_method("body", method!(Request::body, 0))?;
     request_class.define_method("fill_body", method!(Request::fill_body, 1))?;
     request_class.define_method("body_size", method!(Request::body_size, 0))?;
     request_class.define_method("inspect", method!(Request::inspect, 0))?;

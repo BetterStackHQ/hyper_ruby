@@ -70,7 +70,7 @@ class TestHyperRuby < Minitest::Test
 
   def with_server(request_handler, &block)
     server = HyperRuby::Server.new
-    server.configure({ bind_address: "127.0.0.1:3010" })
+    server.configure({ bind_address: "127.0.0.1:3010",tokio_threads: 1 })
     server.start
     
     # Create ruby worker threads that process requests;
@@ -94,7 +94,7 @@ class TestHyperRuby < Minitest::Test
 
   def with_unix_socket_server(request_handler, &block)
     server = HyperRuby::Server.new
-    server.configure({ bind_address: "unix:/tmp/hyper_ruby_test.sock" })
+    server.configure({ bind_address: "unix:/tmp/hyper_ruby_test.sock", tokio_threads: 1 })
     server.start
     
     # Create ruby worker threads that process requests;

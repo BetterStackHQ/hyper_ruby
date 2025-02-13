@@ -36,6 +36,12 @@ impl Request {
         self.request.body().len()
     }
 
+    pub fn body(&self) -> RString {        
+        let buffer = RString::buf_new(self.body_size());
+        self.fill_body(buffer);
+        buffer
+    }
+
     pub fn fill_body(&self, buffer: RString) -> usize {
         let body = self.request.body();
         let body_len = body.len();

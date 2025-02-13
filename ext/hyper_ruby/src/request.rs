@@ -53,7 +53,7 @@ impl Request {
             let inner: VALUE = std::ptr::read(&rb_value as *const _ as *const VALUE);
             rb_str_resize(inner, 0);
             if body_len > 0 {
-                rb_str_cat(inner, body.as_ptr() as *const i8, body.len().try_into().unwrap());
+                rb_str_cat(inner, body.as_ptr(), body.len().try_into().unwrap());
             }
         }
 

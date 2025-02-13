@@ -31,6 +31,11 @@ use hyper_util::server::conn::auto;
 use http_body_util::BodyExt; // You'll need this
 use http_body_util::Full;
 
+use jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[derive(Clone)]
 struct ServerConfig {
     bind_address: String,

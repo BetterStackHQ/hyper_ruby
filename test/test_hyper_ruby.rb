@@ -26,7 +26,8 @@ class TestHyperRuby < Minitest::Test
   end
 
   def test_simple_post
-    with_server(-> (request) { handler_to_json(request) }) do |client|
+    buffer = String.new(capacity: 1024)
+    with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
       response = client.post("/", body: "Hello")
       assert_equal 200, response.status
       assert_equal "application/json", response.headers["content-type"]
@@ -35,7 +36,8 @@ class TestHyperRuby < Minitest::Test
   end
 
   def test_large_post
-    with_server(-> (request) { handler_to_json(request) }) do |client|
+    buffer = String.new(capacity: 1024)
+    with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
       response = client.post("/", body: "a" * 10_000_000)
       assert_equal 200, response.status
       assert_equal "application/json", response.headers["content-type"]
@@ -59,11 +61,12 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  # def test_blocking
-  #   with_server(-> (request) { handler_simple(request) }) do |client|
-  #     gets
-  #   end
-  # end
+  def test_blocking
+    buffer = String.new(capacity: 1024)
+    with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
+      gets
+    end
+  end
 
   def with_server(request_handler, &block)
     server = HyperRuby::Server.new
@@ -118,11 +121,11 @@ class TestHyperRuby < Minitest::Test
     HyperRuby::Response.new(200, { 'Content-Type' => 'text/plain' }, request.http_method)
   end
 
-  def handler_to_json(request)
-    HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.body }.to_json)
+  def handler_to_json(request, buffer)
+    request.fill_body(buffer)
+    HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: buffer }.to_json)
   end
   
-
   def handler_return_header(request, header_key)
     HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.header(header_key) }.to_json)
   end

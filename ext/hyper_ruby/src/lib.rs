@@ -10,7 +10,7 @@ use gvl_helpers::nogvl;
 use magnus::block::block_proc;
 use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
-use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value};
+use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, RString, Ruby, Value};
 use bytes::Bytes;
 
 use std::cell::RefCell;
@@ -46,7 +46,7 @@ impl ServerConfig {
 
 // Sent on the work channel with the request, and a oneshot channel to send the response back on.
 struct RequestWithCompletion {
-    request: Request,
+    request: HyperRequest<Bytes>,
     // sent a response back on this thread
     response_tx: oneshot::Sender<HyperResponse<Full<Bytes>>>,
 }
@@ -85,13 +85,17 @@ impl Server {
     pub fn run_worker(&self) -> Result<(), MagnusError> {
         let block = block_proc().unwrap();
         if let Some(work_rx) = self.work_rx.borrow().as_ref() {
+           
             loop {
                  // Use nogvl to wait for requests outside the GVL
                  let work_request = nogvl(|| work_rx.recv());
                 
                  match work_request {
                     Ok(work_request) => {
-                        let value = unsafe { work_request.request.into_value_unchecked() };
+                        let request = Request {
+                            request: work_request.request,
+                        };
+                        let value = request.into_value();
                         let hyper_response = match block.call::<_, Value>([value]) {
                             Ok(result) => {
                                 let ref_response = Obj::<Response>::try_convert(result).unwrap();
@@ -253,14 +257,10 @@ async fn handle_request(
     let (parts, body) = req.into_parts();
     let body_bytes = body.collect().await?.to_bytes();
 
-    let request = Request {
-        request: HyperRequest::from_parts(parts, body_bytes),
-    };
-
     let (response_tx, response_rx) = oneshot::channel();
 
     let with_completion = RequestWithCompletion {
-        request,
+        request: HyperRequest::from_parts(parts, body_bytes),
         response_tx,
     };
 
@@ -311,7 +311,7 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     request_class.define_method("http_method", method!(Request::method, 0))?;
     request_class.define_method("path", method!(Request::path, 0))?;
     request_class.define_method("header", method!(Request::header, 1))?;
-    request_class.define_method("body", method!(Request::body, 0))?;
+    request_class.define_method("fill_body", method!(Request::fill_body, 1))?;
     request_class.define_method("body_size", method!(Request::body_size, 0))?;
     request_class.define_method("inspect", method!(Request::inspect, 0))?;
 

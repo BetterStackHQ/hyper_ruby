@@ -1,10 +1,12 @@
-use magnus::{value::{qnil, ReprValue}, RString, Value};
+use magnus::{gc, value::{qnil, Opaque, ReprValue}, DataTypeFunctions, IntoValue, RString, Ruby, TypedData, Value};
+
 use bytes::Bytes;
 use hyper::Request as HyperRequest;
 
+use rb_sys::{rb_str_resize, rb_str_cat, VALUE};
+
 // Type passed to ruby giving access to the request properties.
-#[derive(Debug)]
-#[magnus::wrap(class = "HyperRuby::Request", free_immediately)]
+#[magnus::wrap(class = "HyperRuby::Request")]
 pub struct Request {
     pub request: HyperRequest<Bytes>
 }
@@ -34,15 +36,22 @@ impl Request {
         self.request.body().len()
     }
 
-    pub fn body(&self) -> Value {
+    pub fn fill_body(&self, buffer: RString) -> usize {
         let body = self.request.body();
-        if body.is_empty() {
-            return qnil().as_value();
+        let body_len = body.len();
+
+        // Access the ruby string VALUE directly, and resize to 0 (keeping the capacity), 
+        // then copy our buffer into it.
+        unsafe {
+            let rb_value = buffer.as_value();
+            let inner: VALUE = std::ptr::read(&rb_value as *const _ as *const VALUE);
+            rb_str_resize(inner, 0);
+            if body_len > 0 {
+                rb_str_cat(inner, body.as_ptr() as *const i8, body.len().try_into().unwrap());
+            }
         }
 
-        let result = RString::buf_new(body.len());
-        result.cat(body.as_ref());
-        result.as_value()
+        body_len
     }
 
     pub fn inspect(&self) -> RString {

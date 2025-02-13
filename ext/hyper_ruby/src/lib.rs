@@ -10,7 +10,7 @@ use gvl_helpers::nogvl;
 use magnus::block::block_proc;
 use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
-use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, RString, Ruby, Value};
+use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value};
 use bytes::Bytes;
 
 use std::cell::RefCell;

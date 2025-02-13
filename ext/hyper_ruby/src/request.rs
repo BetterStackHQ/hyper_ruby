@@ -1,4 +1,4 @@
-use magnus::{gc, value::{qnil, Opaque, ReprValue}, DataTypeFunctions, IntoValue, RString, Ruby, TypedData, Value};
+use magnus::{value::{qnil, ReprValue}, RString, Value};
 
 use bytes::Bytes;
 use hyper::Request as HyperRequest;

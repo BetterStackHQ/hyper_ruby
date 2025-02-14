@@ -111,42 +111,7 @@ impl Server {
                         let hyper_response = match block.call::<_, Value>([value]) {
                             Ok(result) => {
                                 let ref_response = Obj::<Response>::try_convert(result).unwrap();
-
-                                let mut builder = HyperResponse::builder()
-                                    .status(ref_response.status);
-
-                                // safe because the block result will only ever be called on the ruby thread
-                                let ruby = unsafe { Ruby::get_unchecked() };
-
-                                let ruby_response_headers = ruby.get_inner(ref_response.headers);
-                                let builder_headers = builder.headers_mut().unwrap();
-                                ruby_response_headers.foreach(|key: String, value: String| {
-                                    let header_name = HeaderName::try_from(key).unwrap();
-                                    builder_headers.insert(header_name, value.try_into().unwrap());
-                                    Ok(ForEach::Continue)
-                                }).unwrap();
-
-                                let response_body = ruby.get_inner(ref_response.body);
-                                let response: Result<HyperResponse<Full<Bytes>>, hyper::http::Error>;
-
-                                if response_body.len() > 0 {
-                                    // safe because RString will not be cleared here before we copy the bytes into our own Vector.
-                                    unsafe {
-                                        // copy directly to bytes here so we don't have to worry about encoding checks
-                                        let rust_body = Bytes::copy_from_slice(response_body.as_slice());
-                                        response = builder.body(Full::new(rust_body));
-                                    }
-                                } else {
-                                    response = builder.body(Full::new(Bytes::new()));
-                                }
-
-                                match response {
-                                    Ok(response) => response,
-                                    Err(e) => {
-                                        println!("HTTP request build failed {:?}", e);
-                                        create_error_response("Internal server error")
-                                    }
-                                }
+                                ref_response.response.clone()
                             },
                             Err(e) => {
                                 println!("Block call failed: {:?}", e);

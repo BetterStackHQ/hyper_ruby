@@ -4,6 +4,9 @@ require "test_helper"
 require "httpx"
 
 class TestHyperRuby < Minitest::Test
+
+  ACCEPT_RESPONSE = HyperRuby::Response.new(202, { 'Content-Type' => 'text/plain' }, '').freeze
+
   def test_that_it_has_a_version_number
     refute_nil ::HyperRuby::VERSION
   end
@@ -63,7 +66,7 @@ class TestHyperRuby < Minitest::Test
 
   def test_blocking
     buffer = String.new(capacity: 1024)
-    with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
+    with_server(-> (request) { handler_accept(request, buffer) }) do |client|
       gets
     end
   end
@@ -128,5 +131,10 @@ class TestHyperRuby < Minitest::Test
   
   def handler_return_header(request, header_key)
     HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.header(header_key) }.to_json)
+  end
+
+  def handler_accept(request, buffer)
+    request.fill_body(buffer)
+    ACCEPT_RESPONSE
   end
 end

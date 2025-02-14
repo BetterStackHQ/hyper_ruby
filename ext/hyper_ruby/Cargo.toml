@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-magnus = { version = "0.6.2" }
+magnus = { version = "0.6.2", features = ["rb-sys"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1.5"
 tokio-stream = { version = "0.1", features = ["net"] }

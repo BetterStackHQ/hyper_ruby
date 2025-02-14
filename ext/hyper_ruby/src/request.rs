@@ -5,7 +5,7 @@ use magnus::{value::{qnil, ReprValue}, RString, Value};
 use bytes::Bytes;
 use hyper::Request as HyperRequest;
 
-use rb_sys::{rb_str_resize, rb_str_cat, VALUE};
+use rb_sys::{rb_str_cat, rb_str_resize, RSTRING_PTR, VALUE};
 
 // Type passed to ruby giving access to the request properties.
 #[magnus::wrap(class = "HyperRuby::Request")]
@@ -53,9 +53,11 @@ impl Request {
         unsafe {
             let rb_value = buffer.as_value();
             let inner: VALUE = std::ptr::read(&rb_value as *const _ as *const VALUE);
-            rb_str_resize(inner, 0);
+            rb_str_resize(inner, body_len.try_into().unwrap());
             if body_len > 0 {
-                rb_str_cat(inner, body.as_ptr() as *const c_char, body.len().try_into().unwrap());
+                let body_ptr = body.as_ptr() as *const c_char;
+                let rb_string_ptr = RSTRING_PTR(inner) as *mut c_char;
+                std::ptr::copy(body_ptr, rb_string_ptr, body_len);
             }
         }
 

@@ -1,8 +1,10 @@
+use futures::FutureExt;
 use magnus::{r_hash::ForEach, wrap, RHash, RString, Error as MagnusError};
 
-use hyper::{header::HeaderName, Response as HyperResponse, StatusCode};
-use http_body_util::Full;
+use hyper::{header::HeaderName, Response as HyperResponse};
+use http_body_util::{BodyExt, Full};
 use bytes::Bytes;
+
 // Response object returned to Ruby; holds reference to the opaque ruby types for the headers and body.
 #[wrap(class = "HyperRuby::Response")]
 pub struct Response {
@@ -37,5 +39,28 @@ impl Response {
                 Err(_) => Err(MagnusError::new(magnus::exception::runtime_error(), "Failed to create response"))
             }
         }
+    }
+
+    pub fn status(&self) -> u16 {
+        self.response.status().into()
+    }
+
+    pub fn headers(&self) -> RHash {
+        // map back from the hyper headers to the ruby hash; doesn't need to be performant,
+        // only used in tests
+        let headers = RHash::new();
+        for (name, value) in self.response.headers() {
+            headers.aset(name.to_string(), value.to_str().unwrap().to_string()).unwrap();
+        }
+        headers
+    }
+
+    pub fn body(&self) -> RString {
+        // copy back from the hyper body to the ruby string; doesn't need to be performant,
+        // only used in tests
+        let body = self.response.body();
+        let frame = body.clone().frame().now_or_never().unwrap().unwrap().unwrap();
+        let data_chunk = frame.into_data().unwrap();
+        RString::from_slice(data_chunk.iter().as_slice())
     }
 }

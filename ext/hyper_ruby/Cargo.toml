@@ -20,3 +20,4 @@ hyper = { version = "1.0", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"] }
 http-body-util = "0.1.2"
 jemallocator = { version = "0.5.4", features = ["disable_initial_exec_tls"] }
+futures = "0.3.31"

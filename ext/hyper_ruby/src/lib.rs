@@ -2,13 +2,11 @@ mod request;
 mod response;
 mod gvl_helpers;
 
-use hyper::header::HeaderName;
 use request::Request;
 use response::Response;
 use gvl_helpers::nogvl;
 
 use magnus::block::block_proc;
-use magnus::r_hash::ForEach;
 use magnus::typed_data::Obj;
 use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value};
 use bytes::Bytes;
@@ -298,6 +296,9 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
 
     let response_class = module.define_class("Response", ruby.class_object())?;
     response_class.define_singleton_method("new", function!(Response::new, 3))?;
+    response_class.define_method("status", method!(Response::status, 0))?;
+    response_class.define_method("headers", method!(Response::headers, 0))?;
+    response_class.define_method("body", method!(Response::body, 0))?;
 
     let request_class = module.define_class("Request", ruby.class_object())?;
     request_class.define_method("http_method", method!(Request::method, 0))?;

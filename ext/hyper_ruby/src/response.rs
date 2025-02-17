@@ -59,8 +59,12 @@ impl Response {
         // copy back from the hyper body to the ruby string; doesn't need to be performant,
         // only used in tests
         let body = self.response.body();
-        let frame = body.clone().frame().now_or_never().unwrap().unwrap().unwrap();
-        let data_chunk = frame.into_data().unwrap();
-        RString::from_slice(data_chunk.iter().as_slice())
+        match body.clone().frame().now_or_never() {
+            Some(frame) => {
+                let data_chunk = frame.unwrap().unwrap().into_data().unwrap();
+                RString::from_slice(data_chunk.iter().as_slice())
+            }
+            None => RString::buf_new(0),
+        }
     }
 }

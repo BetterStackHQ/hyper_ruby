@@ -64,12 +64,12 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  def test_blocking
-    buffer = String.new(capacity: 1024)
-    with_server(-> (request) { handler_accept(request, buffer) }) do |client|
-      gets
-    end
-  end
+  # def test_blocking
+  #   buffer = String.new(capacity: 1024)
+  #   with_server(-> (request) { handler_accept(request, buffer) }) do |client|
+  #     gets
+  #   end
+  # end
 
   def with_server(request_handler, &block)
     server = HyperRuby::Server.new

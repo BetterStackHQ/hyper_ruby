@@ -61,7 +61,9 @@ impl Response {
         let body = self.response.body();
         match body.clone().frame().now_or_never() {
             Some(frame) => {
-                let data_chunk = frame.unwrap().unwrap().into_data().unwrap();
+                let frame = frame.unwrap();
+                let frame = frame.unwrap();
+                let data_chunk = frame.into_data().unwrap();
                 RString::from_slice(data_chunk.iter().as_slice())
             }
             None => RString::buf_new(0),

@@ -99,9 +99,17 @@ impl Server {
         if let Some(work_rx) = self.work_rx.borrow().as_ref() {
            
             loop {
-                 // Use nogvl to wait for requests outside the GVL
-                 let work_request = nogvl(|| work_rx.recv());
-                
+                // try getting the next request without yielding the GVL, if there's nothing, wait for one
+                let work_request = match work_rx.try_recv() {
+                    Ok(work_request) => Ok(work_request),
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        nogvl(|| work_rx.recv())
+                    },
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        break;
+                    }
+                };
+
                  match work_request {
                     Ok(work_request) => {
                         let request = Request {

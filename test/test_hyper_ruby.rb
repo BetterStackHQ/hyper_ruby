@@ -79,11 +79,13 @@ class TestHyperRuby < Minitest::Test
     # Create ruby worker threads that process requests;
     # 1 is usually enough, and generally handles better than multiple threads 
     # if there's no IO (because of the GIL)
-    worker = Thread.new do
-      server.run_worker do |request|
-        # Process the request in Ruby
-        # request is a hash with :method, :path, :headers, and :body keys
-        request_handler.call(request)
+    workers = 1.times.map do
+      Thread.new do
+        server.run_worker do |request|
+          # Process the request in Ruby
+          # request is a hash with :method, :path, :headers, and :body keys
+          request_handler.call(request)
+        end
       end
     end
 
@@ -92,7 +94,7 @@ class TestHyperRuby < Minitest::Test
 
   ensure
     server.stop if server
-    worker.join if worker
+    workers.map(&:join) if workers
   end
 
   def with_unix_socket_server(request_handler, &block)
@@ -103,11 +105,13 @@ class TestHyperRuby < Minitest::Test
     # Create ruby worker threads that process requests;
     # 1 is usually enough, and generally handles better than multiple threads 
     # if there's no IO (because of the GIL)
-    worker = Thread.new do
-      server.run_worker do |request|
-        # Process the request in Ruby
-        # request is a hash with :method, :path, :headers, and :body keys
-        request_handler.call(request)
+    workers = 2.times.map do
+      Thread.new do
+        server.run_worker do |request|
+          # Process the request in Ruby
+          # request is a hash with :method, :path, :headers, and :body keys
+          request_handler.call(request)
+        end
       end
     end
 
@@ -117,7 +121,7 @@ class TestHyperRuby < Minitest::Test
 
   ensure
     server.stop if server
-    worker.join if worker
+    workers.map(&:join) if workers
   end
 
   def handler_simple(request)

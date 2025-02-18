@@ -64,12 +64,29 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  # def test_blocking
-  #   buffer = String.new(capacity: 1024)
-  #   with_server(-> (request) { handler_accept(request, buffer) }) do |client|
-  #     gets
-  #   end
-  # end
+  # test OPTIONS and HEAD methods
+  def test_options
+    with_server(-> (request) { handler_simple(request) }) do |client|
+      response = client.options("/", headers: { 'User-Agent' => 'test', 'Origin' => 'http://example.com' })
+      assert_equal 200, response.status
+      assert_equal '', response.body.to_s
+    end
+  end
+
+  def test_head
+    with_server(-> (request) { handler_simple(request) }) do |client|
+      response = client.head("/", headers: { 'User-Agent' => 'test', 'Origin' => 'http://example.com' })
+      assert_equal 200, response.status
+      assert_equal '', response.body.to_s
+    end
+  end
+
+  def test_blocking
+    buffer = String.new(capacity: 1024)
+    with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
+      gets
+    end
+  end
 
   def with_server(request_handler, &block)
     server = HyperRuby::Server.new
@@ -135,6 +152,10 @@ class TestHyperRuby < Minitest::Test
   
   def handler_return_header(request, header_key)
     HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.header(header_key) }.to_json)
+  end
+
+  def handler_dump_request(request)
+    HyperRuby::Response.new(200, { 'Content-Type' => 'text/plain' }, "")
   end
 
   def handler_accept(request, buffer)

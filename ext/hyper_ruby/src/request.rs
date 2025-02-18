@@ -8,6 +8,7 @@ use hyper::Request as HyperRequest;
 use rb_sys::{rb_str_set_len, rb_str_modify, rb_str_modify_expand, rb_str_capacity, RSTRING_PTR, VALUE};
 
 use crate::grpc;
+use log::debug;
 
 // Trait for common buffer filling behavior
 trait FillBuffer {
@@ -144,15 +145,15 @@ impl Request {
 
 impl GrpcRequest {
     pub fn new(request: HyperRequest<Bytes>) -> Option<Self> {
-        println!("Creating GrpcRequest from path: {}", request.uri().path());
+        debug!("Creating GrpcRequest from path: {}", request.uri().path());
         
         // Path format could be "/Echo" or "/echo.Echo/Echo" - handle both
         let path = request.uri().path();
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        println!("  Path parts: {:?}", parts);
+        debug!("  Path parts: {:?}", parts);
         
         if parts.is_empty() {
-            println!("  Failed: Empty path");
+            debug!("  Failed: Empty path");
             return None;
         }
 
@@ -164,7 +165,7 @@ impl GrpcRequest {
             (format!("echo.{}", parts[0]), parts[0].to_string())
         };
 
-        println!("  Extracted service: {}, method: {}", service, method);
+        debug!("  Extracted service: {}, method: {}", service, method);
         
         Some(Self {
             request,

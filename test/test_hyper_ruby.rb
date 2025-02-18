@@ -99,7 +99,7 @@ class TestHyperRuby < Minitest::Test
 
   def test_blocking
     buffer = String.new(capacity: 1024)
-    with_server(-> (request) { handler_grpc(request, buffer) }) do |client|
+    with_server(-> (request) { handler_accept(request, buffer) }) do |client|
       gets
     end
   end
@@ -146,10 +146,8 @@ class TestHyperRuby < Minitest::Test
       # Create request message
       request = Echo::EchoRequest.new(message: "Hello GRPC")
       
-      puts "\n=== Starting gRPC request ==="
       # Make the gRPC call
       response = stub.echo(request)
-      puts "=== gRPC request complete ===\n"
       
       # Check the response
       assert_instance_of Echo::EchoResponse, response
@@ -157,9 +155,68 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
+  def test_concurrent_grpc_requests
+    buffer = String.new(capacity: 1024)
+    with_server(-> (request) { handler_grpc(request, buffer) }) do |_client|
+      # Create a gRPC stub using the standard Ruby gRPC client
+      stub = Echo::Echo::Stub.new(
+        "127.0.0.1:3010",
+        :this_channel_is_insecure,
+        channel_args: {
+          'grpc.enable_http_proxy' => 0
+        }
+      )
+      
+      # Create multiple threads to send requests concurrently
+      threads = 5.times.map do |i|
+        Thread.new do
+          request = Echo::EchoRequest.new(message: "Hello GRPC #{i}")
+          response = stub.echo(request)
+          [i, response]
+        end
+      end
+
+      # Collect and verify all responses
+      responses = threads.map(&:value)
+      responses.each do |i, response|
+        assert_instance_of Echo::EchoResponse, response
+        assert_equal "Hello GRPC #{i} response", response.message
+      end
+    end
+  end
+
+  def test_request_type_detection
+    with_server(-> (request) { handler_detect_type(request) }) do |client|
+      # Test regular HTTP request
+      http_response = client.post("/echo", body: "Hello HTTP")
+      assert_equal 200, http_response.status
+      assert_equal "text/plain", http_response.headers["content-type"]
+      assert_equal "HTTP request: Hello HTTP", http_response.body
+
+      # Test gRPC request using the gRPC client
+      stub = Echo::Echo::Stub.new(
+        "127.0.0.1:3010",
+        :this_channel_is_insecure,
+        channel_args: {
+          'grpc.enable_http_proxy' => 0
+        }
+      )
+      
+      request = Echo::EchoRequest.new(message: "Hello gRPC")
+      grpc_response = stub.echo(request)
+      
+      assert_instance_of Echo::EchoResponse, grpc_response
+      assert_equal "gRPC request: Hello gRPC", grpc_response.message
+    end
+  end
+
   def with_server(request_handler, &block)
     server = HyperRuby::Server.new
-    server.configure({ bind_address: "127.0.0.1:3010",tokio_threads: 1 })
+    server.configure({ 
+      bind_address: "127.0.0.1:3010",
+      tokio_threads: 1,
+      #debug: true 
+    })
     server.start
     
     # Create ruby worker threads that process requests;
@@ -185,7 +242,11 @@ class TestHyperRuby < Minitest::Test
 
   def with_unix_socket_server(request_handler, &block)
     server = HyperRuby::Server.new
-    server.configure({ bind_address: "unix:/tmp/hyper_ruby_test.sock", tokio_threads: 1 })
+    server.configure({ 
+      bind_address: "unix:/tmp/hyper_ruby_test.sock", 
+      tokio_threads: 1,
+      #debug: true 
+    })
     server.start
     
     # Create ruby worker threads that process requests;
@@ -251,5 +312,25 @@ class TestHyperRuby < Minitest::Test
     
     # Return gRPC response
     HyperRuby::GrpcResponse.new(0, response_data)
+  end
+
+  def handler_detect_type(request)
+    if request.is_a?(HyperRuby::GrpcRequest)
+      # Handle gRPC request
+      buffer = String.new(capacity: 1024)
+      request.fill_body(buffer)
+      echo_request = Echo::EchoRequest.decode(buffer)
+      
+      echo_response = Echo::EchoResponse.new(message: "gRPC request: #{echo_request.message}")
+      response_data = Echo::EchoResponse.encode(echo_response)
+      
+      HyperRuby::GrpcResponse.new(0, response_data)
+    else
+      # Handle regular HTTP request
+      buffer = String.new(capacity: 1024)
+      request.fill_body(buffer)
+      
+      HyperRuby::Response.new(200, { 'Content-Type' => 'text/plain' }, "HTTP request: #{buffer}")
+    end
   end
 end

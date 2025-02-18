@@ -21,11 +21,11 @@ impl std::error::Error for ResponseError {}
 pub struct BodyWithTrailers {
     data: Bytes,
     trailers_sent: bool,
-    trailers: HeaderMap,
+    trailers: Option<HeaderMap>,
 }
 
 impl BodyWithTrailers {
-    pub fn new(data: Bytes, trailers: HeaderMap) -> Self {
+    pub fn new(data: Bytes, trailers: Option<HeaderMap>) -> Self {
         Self {
             data,
             trailers_sent: false,
@@ -54,7 +54,9 @@ impl Body for BodyWithTrailers {
         
         if !self.trailers_sent {
             self.trailers_sent = true;
-            return std::task::Poll::Ready(Some(Ok(Frame::trailers(self.trailers.clone()))));
+            if let Some(trailers) = &self.trailers {
+                return std::task::Poll::Ready(Some(Ok(Frame::trailers(trailers.clone()))));
+            }
         }
         
         std::task::Poll::Ready(None)
@@ -85,19 +87,16 @@ impl Response {
             Ok(ForEach::Continue)
         }).unwrap();
                 
-        let mut trailers = HeaderMap::new();
-        trailers.insert("grpc-status", "0".parse().unwrap());
-
         if body.len() > 0 {
             unsafe {
                 let rust_body = Bytes::copy_from_slice(body.as_slice());
-                match builder.body(BodyWithTrailers::new(rust_body, trailers)) {
+                match builder.body(BodyWithTrailers::new(rust_body, None)) {
                     Ok(response) => Ok(Self { response }),
                     Err(_) => Err(MagnusError::new(magnus::exception::runtime_error(), "Failed to create response"))
                 }
             }
         } else {
-            match builder.body(BodyWithTrailers::new(Bytes::new(), trailers)) {
+            match builder.body(BodyWithTrailers::new(Bytes::new(), None)) {
                 Ok(response) => Ok(Self { response }),
                 Err(_) => Err(MagnusError::new(magnus::exception::runtime_error(), "Failed to create response"))
             }
@@ -141,7 +140,7 @@ impl GrpcResponse {
         trailers.insert("grpc-accept-encoding", "identity".parse().unwrap());
         trailers.insert("accept-encoding", "identity".parse().unwrap());
         
-        Ok(Self { response: builder.body(BodyWithTrailers::new(framed_message, trailers)).unwrap() })
+        Ok(Self { response: builder.body(BodyWithTrailers::new(framed_message, Some(trailers))).unwrap() })
     }
 
     pub fn error(status: Value, message: RString) -> Result<Self, MagnusError> {
@@ -161,7 +160,7 @@ impl GrpcResponse {
             trailers.insert("grpc-message", message_str.parse().unwrap());
         }
 
-        Ok(Self { response: builder.body(BodyWithTrailers::new(Bytes::new(), trailers)).unwrap() })
+        Ok(Self { response: builder.body(BodyWithTrailers::new(Bytes::new(), Some(trailers))).unwrap() })
     }
 
     pub fn status(&self) -> u16 {

@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use crossbeam_channel;
 
 use hyper::service::service_fn;
-use hyper::{Error, Request as HyperRequest, Response as HyperResponse, StatusCode, Method, header::HeaderMap};
+use hyper::{Error, Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
@@ -35,6 +35,9 @@ use log::{debug, info, warn};
 
 use env_logger;
 use crate::response::BodyWithTrailers;
+use std::sync::Once;
+
+static LOGGER_INIT: Once = Once::new();
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -43,6 +46,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 struct ServerConfig {
     bind_address: String,
     tokio_threads: Option<usize>,
+    debug: bool,
 }
 
 impl ServerConfig {
@@ -50,6 +54,7 @@ impl ServerConfig {
         Self {
             bind_address: String::from("127.0.0.1:3000"),
             tokio_threads: None,
+            debug: false,
         }
     }
 }
@@ -92,6 +97,19 @@ impl Server {
             server_config.tokio_threads = Some(usize::try_convert(tokio_threads)?);
         }
 
+        if let Some(debug) = config.get(magnus::Symbol::new("debug")) {
+            server_config.debug = bool::try_convert(debug)?;
+        }
+
+        // Initialize logging if debug is enabled, but only do it once
+        if server_config.debug {
+            LOGGER_INIT.call_once(|| {
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("hyper=debug,h2=debug"))
+                    .write_style(env_logger::WriteStyle::Always)
+                    .init();
+            });
+        }
+
         Ok(())
     }
 
@@ -116,26 +134,26 @@ impl Server {
                     Ok(work_request) => {
                         let hyper_request = work_request.request;
                         
-                        println!("\nProcessing request:");
-                        println!("  Method: {}", hyper_request.method());
-                        println!("  Path: {}", hyper_request.uri().path());
-                        println!("  Headers: {:?}", hyper_request.headers());
+                        debug!("Processing request:");
+                        debug!("  Method: {}", hyper_request.method());
+                        debug!("  Path: {}", hyper_request.uri().path());
+                        debug!("  Headers: {:?}", hyper_request.headers());
                         
                         // Convert to appropriate request type
                         let value = if grpc::is_grpc_request(&hyper_request) {
-                            println!("Request identified as gRPC");
+                            debug!("Request identified as gRPC");
                             if let Some(grpc_request) = GrpcRequest::new(hyper_request) {
                                 grpc_request.into_value()
                             } else {
-                                println!("Failed to create GrpcRequest");
+                                warn!("Failed to create GrpcRequest");
                                 // Invalid gRPC request path
                                 let response = GrpcResponse::error(3_u32.into_value(), RString::new("Invalid gRPC request path")).unwrap()
                                     .into_hyper_response();
-                                work_request.response_tx.send(response).unwrap_or_else(|e| println!("Failed to send response: {:?}", e));
+                                work_request.response_tx.send(response).unwrap_or_else(|e| warn!("Failed to send response: {:?}", e));
                                 continue;
                             }
                         } else {
-                            println!("Request identified as HTTP");
+                            debug!("Request identified as HTTP");
                             Request::new(hyper_request).into_value()
                         };
 
@@ -147,19 +165,19 @@ impl Server {
                                 } else if let Ok(http_response) = Obj::<Response>::try_convert(result) {
                                     (*http_response).clone().into_hyper_response()
                                 } else {
-                                    println!("Block returned invalid response type");
+                                    warn!("Block returned invalid response type");
                                     create_error_response("Internal server error")
                                 }
                             },
                             Err(e) => {
-                                println!("Block call failed: {:?}", e);
+                                warn!("Block call failed: {:?}", e);
                                 create_error_response("Internal server error")
                             }
                         };
 
                         match work_request.response_tx.send(hyper_response) {
                             Ok(_) => (),
-                            Err(e) => println!("Failed to send response: {:?}", e),
+                            Err(e) => warn!("Failed to send response: {:?}", e),
                         }
                     }
                     Err(_) => {
@@ -253,7 +271,7 @@ impl Server {
         if bind_address.starts_with("unix:") {
             let path = bind_address.trim_start_matches("unix:");
             std::fs::remove_file(path).unwrap_or_else(|e| {
-                println!("Failed to remove socket file: {:?}", e);
+                warn!("Failed to remove socket file: {:?}", e);
             });
         }
 
@@ -349,20 +367,13 @@ fn create_error_response(error_message: &str) -> HyperResponse<BodyWithTrailers>
     let builder = HyperResponse::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .header("content-type", "text/plain");
-
-    let trailers = HeaderMap::new();
     
-    builder.body(BodyWithTrailers::new(Bytes::from(error_message.to_string()), trailers))
+    builder.body(BodyWithTrailers::new(Bytes::from(error_message.to_string()), None))
         .unwrap()
 }
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), MagnusError> {
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("hyper=debug,h2=debug"))
-        .write_style(env_logger::WriteStyle::Always)
-        .init();
-
     let module = ruby.define_module("HyperRuby")?;
 
     let server_class = module.define_class("Server", ruby.class_object())?;

@@ -124,5 +124,5 @@ pub fn create_grpc_error_response(http_status: u16, grpc_status: u32, message: &
     }
     
     // Create response with custom body that includes trailers
-    builder.body(BodyWithTrailers::new(Bytes::new(), trailers)).unwrap()
+    builder.body(BodyWithTrailers::new(Bytes::new(), Some(trailers))).unwrap()
 } 

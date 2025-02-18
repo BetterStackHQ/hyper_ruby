@@ -21,3 +21,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"]
 http-body-util = "0.1.2"
 jemallocator = { version = "0.5.4", features = ["disable_initial_exec_tls"] }
 futures = "0.3.31"
+h2 = "0.4"
+async-stream = "0.3.5"
+env_logger = "0.11"
+log = "0.4"

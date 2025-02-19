@@ -115,8 +115,7 @@ pub fn create_grpc_error_response(http_status: u16, grpc_status: u32, message: &
     // Create trailers
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", grpc_status.to_string().parse().unwrap());
-    trailers.insert("grpc-accept-encoding", "identity".parse().unwrap());
-    trailers.insert("accept-encoding", "identity".parse().unwrap());
+    trailers.insert("grpc-accept-encoding", "identity,gzip,deflate,zstd".parse().unwrap());
     
     // Add grpc-message if provided
     if !message.is_empty() {

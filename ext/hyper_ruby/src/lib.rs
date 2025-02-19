@@ -36,6 +36,11 @@ use log::{debug, info, warn};
 use env_logger;
 use crate::response::BodyWithTrailers;
 use std::sync::Once;
+use tokio::time::timeout;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::time::{Sleep, sleep};
 
 static LOGGER_INIT: Once = Once::new();
 
@@ -47,6 +52,7 @@ struct ServerConfig {
     bind_address: String,
     tokio_threads: Option<usize>,
     debug: bool,
+    recv_timeout: u64,
 }
 
 impl ServerConfig {
@@ -55,6 +61,7 @@ impl ServerConfig {
             bind_address: String::from("127.0.0.1:3000"),
             tokio_threads: None,
             debug: false,
+            recv_timeout: 30000, // Default 30 second timeout
         }
     }
 }
@@ -99,6 +106,10 @@ impl Server {
 
         if let Some(debug) = config.get(magnus::Symbol::new("debug")) {
             server_config.debug = bool::try_convert(debug)?;
+        }
+
+        if let Some(recv_timeout) = config.get(magnus::Symbol::new("recv_timeout")) {
+            server_config.recv_timeout = u64::try_convert(recv_timeout)?;
         }
 
         // Initialize logging if debug is enabled, but only do it once
@@ -215,6 +226,8 @@ impl Server {
             let work_tx = work_tx.clone();
             
             let server_task = tokio::spawn(async move {
+                let timer = hyper_util::rt::TokioTimer::new();
+
                 if config.bind_address.starts_with("unix:") {
                     let path = config.bind_address.trim_start_matches("unix:");
                     let listener = UnixListener::bind(path).unwrap();
@@ -222,9 +235,10 @@ impl Server {
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
                         let work_tx = work_tx.clone();
+                        let timer = timer.clone();
 
                         tokio::task::spawn(async move {
-                            handle_connection(stream, work_tx).await;
+                            handle_connection(stream, work_tx, config.recv_timeout, timer).await;
                         });
                     }
                 } else {
@@ -235,9 +249,10 @@ impl Server {
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
                         let work_tx = work_tx.clone();
+                        let timer = timer.clone();
 
                         tokio::task::spawn(async move {
-                            handle_connection(stream, work_tx).await;
+                            handle_connection(stream, work_tx, config.recv_timeout, timer).await;
                         });
                     }
                 }
@@ -282,6 +297,7 @@ impl Server {
 async fn handle_request(
     req: HyperRequest<Incoming>,
     work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
+    recv_timeout: u64,
 ) -> Result<HyperResponse<BodyWithTrailers>, Error> {
     debug!("Received request: {:?}", req);
     debug!("HTTP version: {:?}", req.version());
@@ -289,12 +305,19 @@ async fn handle_request(
 
     let (parts, body) = req.into_parts();
     
-    // Collect the body
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
+    // Collect the body with timeout
+    let body_bytes = match timeout(
+        std::time::Duration::from_millis(recv_timeout),
+        body.collect()
+    ).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(e)) => {
             debug!("Error collecting body: {:?}", e);
             return Err(e);
+        },
+        Err(_) => {
+            debug!("Timeout collecting body");
+            return Ok(create_timeout_response());
         }
     };
     
@@ -336,23 +359,42 @@ async fn handle_request(
     }
 }
 
+fn create_timeout_response() -> HyperResponse<BodyWithTrailers> {
+    let builder = HyperResponse::builder()
+        .status(StatusCode::REQUEST_TIMEOUT)
+        .header("content-type", "text/plain");
+    
+    builder.body(BodyWithTrailers::new(Bytes::from("Request timed out while receiving body"), None))
+        .unwrap()
+}
+
 async fn handle_connection(
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
+    recv_timeout: u64,
+    timer: hyper_util::rt::TokioTimer,
 ) {
     info!("New connection established");
     
     let service = service_fn(move |req: HyperRequest<Incoming>| {
         debug!("Service handling request");
         let work_tx = work_tx.clone();
-        handle_request(req, work_tx)
+        handle_request(req, work_tx, recv_timeout)
     });
 
     let io = TokioIo::new(stream);
     
-    debug!("Setting up HTTP/2 connection");
-    let builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    
+    debug!("Setting up connection");
+    let mut builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+
+    builder.http1()
+           .header_read_timeout(std::time::Duration::from_millis(recv_timeout))
+           .timer(timer.clone());
+
+    builder.http2()
+           .keep_alive_interval(std::time::Duration::from_secs(10))
+           .timer(timer);
+
     if let Err(err) = builder
         .serve_connection(io, service)
         .await

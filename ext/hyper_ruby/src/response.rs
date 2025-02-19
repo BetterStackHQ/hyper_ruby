@@ -20,6 +20,7 @@ impl std::error::Error for ResponseError {}
 #[derive(Debug, Clone)]
 pub struct BodyWithTrailers {
     data: Bytes,
+    data_sent: bool,
     trailers_sent: bool,
     trailers: Option<HeaderMap>,
 }
@@ -28,6 +29,7 @@ impl BodyWithTrailers {
     pub fn new(data: Bytes, trailers: Option<HeaderMap>) -> Self {
         Self {
             data,
+            data_sent: false,
             trailers_sent: false,
             trailers,
         }
@@ -46,9 +48,9 @@ impl Body for BodyWithTrailers {
         mut self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if !self.data.is_empty() {
+        if !self.data_sent && !self.data.is_empty() {
+            self.data_sent = true;
             let data = self.data.clone();
-            self.data = Bytes::new();
             return std::task::Poll::Ready(Some(Ok(Frame::data(data))));
         }
         
@@ -90,12 +92,20 @@ impl Response {
         if body.len() > 0 {
             unsafe {
                 let rust_body = Bytes::copy_from_slice(body.as_slice());
+                builder_headers.insert(
+                    HeaderName::from_static("content-length"),
+                    rust_body.len().to_string().try_into().unwrap()
+                );
                 match builder.body(BodyWithTrailers::new(rust_body, None)) {
                     Ok(response) => Ok(Self { response }),
                     Err(_) => Err(MagnusError::new(magnus::exception::runtime_error(), "Failed to create response"))
                 }
             }
         } else {
+            builder_headers.insert(
+                HeaderName::from_static("content-length"),
+                "0".try_into().unwrap()
+            );
             match builder.body(BodyWithTrailers::new(Bytes::new(), None)) {
                 Ok(response) => Ok(Self { response }),
                 Err(_) => Err(MagnusError::new(magnus::exception::runtime_error(), "Failed to create response"))
@@ -137,8 +147,7 @@ impl GrpcResponse {
         
         let mut trailers = HeaderMap::new();
         trailers.insert("grpc-status", status.to_string().parse().unwrap());
-        trailers.insert("grpc-accept-encoding", "identity".parse().unwrap());
-        trailers.insert("accept-encoding", "identity".parse().unwrap());
+        trailers.insert("grpc-accept-encoding", "identity,gzip,deflate,zstd".parse().unwrap());
         
         Ok(Self { response: builder.body(BodyWithTrailers::new(framed_message, Some(trailers))).unwrap() })
     }
@@ -153,8 +162,7 @@ impl GrpcResponse {
         
         let mut trailers = HeaderMap::new();
         trailers.insert("grpc-status", status_num.to_string().parse().unwrap());
-        trailers.insert("grpc-accept-encoding", "identity".parse().unwrap());
-        trailers.insert("accept-encoding", "identity".parse().unwrap());
+        trailers.insert("grpc-accept-encoding", "identity,gzip,deflate,zstd".parse().unwrap());
         
         if !message_str.is_empty() {
             trailers.insert("grpc-message", message_str.parse().unwrap());

@@ -6,6 +6,17 @@ PATH
 GEM
   remote: https://rubygems.org/
   specs:
+    google-protobuf (3.25.6)
+    google-protobuf (3.25.6-arm64-darwin)
+    googleapis-common-protos-types (1.18.0)
+      google-protobuf (>= 3.18, < 5.a)
+    grpc (1.70.1)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.70.1-arm64-darwin)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc-tools (1.70.1)
     http-2 (1.0.2)
     httpx (1.4.0)
       http-2 (>= 1.0.0)
@@ -22,9 +33,12 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
-  httpx (~> 1.4)
+  google-protobuf (~> 3.25)
+  grpc (~> 1.62)
+  grpc-tools (~> 1.62)
+  httpx (~> 1.2)
   hyper_ruby!
-  minitest (~> 5.16)
+  minitest (~> 5.0)
   rake (~> 13.0)
   rake-compiler
   rb_sys (~> 0.9.63)

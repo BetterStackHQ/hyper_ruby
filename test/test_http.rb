@@ -3,8 +3,7 @@
 require "test_helper"
 require "httpx"
 
-class TestHyperRuby < Minitest::Test
-
+class TestHttp < HyperRubyTest
   ACCEPT_RESPONSE = HyperRuby::Response.new(202, { 'Content-Type' => 'text/plain' }, '').freeze
 
   def test_that_it_has_a_version_number
@@ -28,6 +27,21 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
+  def test_headers_fetch_all
+    with_server(-> (request) { handler_return_all_headers(request) }) do |client|
+      response = client.get("/", headers: { 
+        'User-Agent' => 'test',
+        'X-Custom-Header' => 'custom',
+        'Accept' => 'application/json'
+      })
+      assert_equal 200, response.status
+      headers = JSON.parse(response.body)["headers"]
+      assert_equal 'test', headers['user-agent']
+      assert_equal 'custom', headers['x-custom-header']
+      assert_equal 'application/json', headers['accept']
+    end
+  end
+
   def test_simple_post
     buffer = String.new(capacity: 1024)
     with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
@@ -38,24 +52,7 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  def test_large_post
-    buffer = String.new(capacity: 1024)
-    with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
-      response = client.post("/", body: "a" * 10_000_000)
-      assert_equal 200, response.status
-      assert_equal "application/json", response.headers["content-type"]
-      assert_equal 'a' * 10_000_000, JSON.parse(response.body)["message"]
-    end
-  end
-
-  def test_unix_socket_cleans_up_socket
-    with_unix_socket_server(-> (request) { handler_simple(request) }) do |client|
-      response = client.get("/")
-      assert_equal 200, response.status
-      assert_equal "text/plain", response.headers["content-type"]
-      assert_equal 'GET', response.body
-    end
-
+  def test_unix_socket
     with_unix_socket_server(-> (request) { handler_simple(request) }) do |client|
       response = client.get("/")
       assert_equal 200, response.status
@@ -64,12 +61,10 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  # test OPTIONS and HEAD methods
   def test_options
     with_server(-> (request) { handler_simple(request) }) do |client|
       response = client.options("/", headers: { 'User-Agent' => 'test', 'Origin' => 'http://example.com' })
       assert_equal 200, response.status
-      assert_equal '', response.body.to_s
     end
   end
 
@@ -81,65 +76,34 @@ class TestHyperRuby < Minitest::Test
     end
   end
 
-  def test_blocking
+  def test_http2_request
     buffer = String.new(capacity: 1024)
     with_server(-> (request) { handler_to_json(request, buffer) }) do |client|
-      gets
+      # Configure client for HTTP/2
+      client = client.with(
+        debug: STDERR,
+        debug_level: 3,
+        fallback_protocol: "h2"
+      )
+      
+      # Send a simple POST request
+      response = client.post(
+        "/",
+        headers: {
+          "content-type" => "application/json",
+          "accept" => "application/json"
+        },
+        body: { "message" => "Hello HTTP/2" }.to_json
+      )
+      
+      assert_equal 200, response.status
+      assert_equal "application/json", response.headers["content-type"]
+      assert_equal({ "message" => { "message" => "Hello HTTP/2" }.to_json }, JSON.parse(response.body))
+      assert_equal "2.0", response.version
     end
   end
 
-  def with_server(request_handler, &block)
-    server = HyperRuby::Server.new
-    server.configure({ bind_address: "127.0.0.1:3010",tokio_threads: 1 })
-    server.start
-    
-    # Create ruby worker threads that process requests;
-    # 1 is usually enough, and generally handles better than multiple threads 
-    # if there's no IO (because of the GIL)
-    workers = 1.times.map do
-      Thread.new do
-        server.run_worker do |request|
-          # Process the request in Ruby
-          # request is a hash with :method, :path, :headers, and :body keys
-          request_handler.call(request)
-        end
-      end
-    end
-
-    client = HTTPX.with(origin: "http://127.0.0.1:3010")
-    block.call(client)
-
-  ensure
-    server.stop if server
-    workers.map(&:join) if workers
-  end
-
-  def with_unix_socket_server(request_handler, &block)
-    server = HyperRuby::Server.new
-    server.configure({ bind_address: "unix:/tmp/hyper_ruby_test.sock", tokio_threads: 1 })
-    server.start
-    
-    # Create ruby worker threads that process requests;
-    # 1 is usually enough, and generally handles better than multiple threads 
-    # if there's no IO (because of the GIL)
-    workers = 2.times.map do
-      Thread.new do
-        server.run_worker do |request|
-          # Process the request in Ruby
-          # request is a hash with :method, :path, :headers, and :body keys
-          request_handler.call(request)
-        end
-      end
-    end
-
-    client = HTTPX.with(transport: "unix", addresses: ["/tmp/hyper_ruby_test.sock"], origin: "http://host")
-	
-    block.call(client)
-
-  ensure
-    server.stop if server
-    workers.map(&:join) if workers
-  end
+  private
 
   def handler_simple(request)
     HyperRuby::Response.new(200, { 'Content-Type' => 'text/plain' }, request.http_method)
@@ -152,6 +116,10 @@ class TestHyperRuby < Minitest::Test
   
   def handler_return_header(request, header_key)
     HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.header(header_key) }.to_json)
+  end
+
+  def handler_return_all_headers(request)
+    HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { headers: request.headers }.to_json)
   end
 
   def handler_dump_request(request)

@@ -17,7 +17,11 @@ tokio-stream = { version = "0.1", features = ["net"] }
 crossbeam-channel = "0.5.14"
 rb-sys = "0.9.110"
 hyper = { version = "1.0", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.2"
 jemallocator = { version = "0.5.4", features = ["disable_initial_exec_tls"] }
 futures = "0.3.31"
+h2 = "0.4"
+async-stream = "0.3.5"
+env_logger = "0.11"
+log = "0.4"

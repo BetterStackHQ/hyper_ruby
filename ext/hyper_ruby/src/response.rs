@@ -1,14 +1,80 @@
-use futures::FutureExt;
-use magnus::{r_hash::ForEach, wrap, RHash, RString, Error as MagnusError};
-
-use hyper::{header::HeaderName, Response as HyperResponse};
-use http_body_util::{BodyExt, Full};
+use magnus::{r_hash::ForEach, RHash, RString, Error as MagnusError, Value, TryConvert};
+use hyper::{header::{HeaderName, HeaderMap}, Response as HyperResponse};
+use hyper::body::{Frame, Body};
 use bytes::Bytes;
+use std::pin::Pin;
+use crate::grpc;
 
-// Response object returned to Ruby; holds reference to the opaque ruby types for the headers and body.
-#[wrap(class = "HyperRuby::Response")]
+#[derive(Debug, Clone)]
+pub struct ResponseError(String);
+
+impl std::fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ResponseError: {}", self.0)
+    }
+}
+
+impl std::error::Error for ResponseError {}
+
+// Define a custom body type that can include trailers
+#[derive(Debug, Clone)]
+pub struct BodyWithTrailers {
+    data: Bytes,
+    data_sent: bool,
+    trailers_sent: bool,
+    trailers: Option<HeaderMap>,
+}
+
+impl BodyWithTrailers {
+    pub fn new(data: Bytes, trailers: Option<HeaderMap>) -> Self {
+        Self {
+            data,
+            data_sent: false,
+            trailers_sent: false,
+            trailers,
+        }
+    }
+
+    pub fn get_data(&self) -> &Bytes {
+        &self.data
+    }
+}
+
+impl Body for BodyWithTrailers {
+    type Data = Bytes;
+    type Error = ResponseError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if !self.data_sent && !self.data.is_empty() {
+            self.data_sent = true;
+            let data = self.data.clone();
+            return std::task::Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        
+        if !self.trailers_sent {
+            self.trailers_sent = true;
+            if let Some(trailers) = &self.trailers {
+                return std::task::Poll::Ready(Some(Ok(Frame::trailers(trailers.clone()))));
+            }
+        }
+        
+        std::task::Poll::Ready(None)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[magnus::wrap(class = "HyperRuby::Response")]
 pub struct Response {
-    pub response: HyperResponse<Full<Bytes>>
+    response: HyperResponse<BodyWithTrailers>
+}
+
+#[derive(Debug, Clone)]
+#[magnus::wrap(class = "HyperRuby::GrpcResponse")]
+pub struct GrpcResponse {
+    response: HyperResponse<BodyWithTrailers>
 }
 
 impl Response {
@@ -24,17 +90,23 @@ impl Response {
         }).unwrap();
                 
         if body.len() > 0 {
-            // safe because RString will not be cleared here before we copy the bytes into our own Vector.
             unsafe {
-                // copy directly to bytes here so we don't have to worry about encoding checks
                 let rust_body = Bytes::copy_from_slice(body.as_slice());
-                match builder.body(Full::new(rust_body)) {
+                builder_headers.insert(
+                    HeaderName::from_static("content-length"),
+                    rust_body.len().to_string().try_into().unwrap()
+                );
+                match builder.body(BodyWithTrailers::new(rust_body, None)) {
                     Ok(response) => Ok(Self { response }),
                     Err(_) => Err(MagnusError::new(magnus::exception::runtime_error(), "Failed to create response"))
                 }
             }
         } else {
-            match builder.body(Full::new(Bytes::new())) {
+            builder_headers.insert(
+                HeaderName::from_static("content-length"),
+                "0".try_into().unwrap()
+            );
+            match builder.body(BodyWithTrailers::new(Bytes::new(), None)) {
                 Ok(response) => Ok(Self { response }),
                 Err(_) => Err(MagnusError::new(magnus::exception::runtime_error(), "Failed to create response"))
             }
@@ -46,8 +118,6 @@ impl Response {
     }
 
     pub fn headers(&self) -> RHash {
-        // map back from the hyper headers to the ruby hash; doesn't need to be performant,
-        // only used in tests
         let headers = RHash::new();
         for (name, value) in self.response.headers() {
             headers.aset(name.to_string(), value.to_str().unwrap().to_string()).unwrap();
@@ -56,21 +126,82 @@ impl Response {
     }
 
     pub fn body(&self) -> RString {
-        // copy back from the hyper body to the ruby string; doesn't need to be performant,
-        // only used in tests
-        let body = self.response.body();
-        match body.clone().frame().now_or_never() {
-            Some(frame) => {
-                match frame {
-                    Some(frame) => {
-                        let frame = frame.unwrap();
-                        let data_chunk = frame.into_data().unwrap();
-                        RString::from_slice(data_chunk.iter().as_slice())
-                    },
-                    None => RString::buf_new(0),
+        // For non-gRPC responses, just return the data part
+        let body = self.response.body().get_data();
+        RString::from_slice(body.as_ref())
+    }
+
+    pub fn into_hyper_response(self) -> HyperResponse<BodyWithTrailers> {
+        self.response
+    }
+}
+
+impl GrpcResponse {
+    pub fn new(status: u16, body: RString) -> Result<Self, MagnusError> {
+        let builder = HyperResponse::builder()
+            .status(200)  // Always 200 for gRPC
+            .header("content-type", "application/grpc+proto");
+
+        let body_bytes = unsafe { Bytes::copy_from_slice(body.as_slice()) };
+        let framed_message = grpc::encode_grpc_frame(&body_bytes);
+        
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", status.to_string().parse().unwrap());
+        trailers.insert("grpc-accept-encoding", "identity,gzip,deflate,zstd".parse().unwrap());
+        
+        Ok(Self { response: builder.body(BodyWithTrailers::new(framed_message, Some(trailers))).unwrap() })
+    }
+
+    pub fn error(status: Value, message: RString) -> Result<Self, MagnusError> {
+        let status_num = u32::try_convert(status)?;
+        let message_str = unsafe { message.as_str().unwrap() };
+        
+        let builder = HyperResponse::builder()
+            .status(200)  // Always 200 for gRPC
+            .header("content-type", "application/grpc+proto");
+        
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", status_num.to_string().parse().unwrap());
+        trailers.insert("grpc-accept-encoding", "identity,gzip,deflate,zstd".parse().unwrap());
+        
+        if !message_str.is_empty() {
+            trailers.insert("grpc-message", message_str.parse().unwrap());
+        }
+
+        Ok(Self { response: builder.body(BodyWithTrailers::new(Bytes::new(), Some(trailers))).unwrap() })
+    }
+
+    pub fn status(&self) -> u16 {
+        // For gRPC, we need to look at the grpc-status header
+        if let Some(status) = self.response.headers().get("grpc-status") {
+            if let Ok(status_str) = status.to_str() {
+                if let Ok(status_num) = status_str.parse::<u16>() {
+                    return status_num;
                 }
             }
-            None => RString::buf_new(0),
         }
+        0 // Default to OK if no status found
+    }
+
+    pub fn headers(&self) -> RHash {
+        let headers = RHash::new();
+        for (name, value) in self.response.headers() {
+            headers.aset(name.to_string(), value.to_str().unwrap().to_string()).unwrap();
+        }
+        headers
+    }
+
+    pub fn body(&self) -> RString {
+        // For gRPC responses, decode the frame
+        let body = self.response.body().get_data();
+        if let Some((_, message)) = grpc::decode_grpc_frame(body) {
+            RString::from_slice(message.as_ref())
+        } else {
+            RString::new("")
+        }
+    }
+
+    pub fn into_hyper_response(self) -> HyperResponse<BodyWithTrailers> {
+        self.response
     }
 }

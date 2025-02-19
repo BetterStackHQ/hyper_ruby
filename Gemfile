@@ -10,6 +10,11 @@ gem "rake", "~> 13.0"
 gem "rake-compiler"
 gem "rb_sys", "~> 0.9.63"
 
-gem "minitest", "~> 5.16"
+gem "minitest", "~> 5.0"
 
-gem "httpx", "~> 1.4"
+gem "httpx", "~> 1.2"
+
+# gRPC dependencies
+gem "grpc", "~> 1.62"
+gem "grpc-tools", "~> 1.62"
+gem "google-protobuf", "~> 3.25"

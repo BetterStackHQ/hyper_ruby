@@ -1,14 +1,15 @@
 mod request;
 mod response;
 mod gvl_helpers;
+mod grpc;
 
-use request::Request;
-use response::Response;
+use request::{Request, GrpcRequest};
+use response::{Response, GrpcResponse};
 use gvl_helpers::nogvl;
 
 use magnus::block::block_proc;
 use magnus::typed_data::Obj;
-use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value};
+use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value, RString};
 use bytes::Bytes;
 
 use std::cell::RefCell;
@@ -26,10 +27,18 @@ use hyper::{Error, Request as HyperRequest, Response as HyperResponse, StatusCod
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
-use http_body_util::BodyExt; // You'll need this
-use http_body_util::Full;
+use http_body_util::BodyExt;
 
 use jemallocator::Jemalloc;
+
+use log::{debug, info, warn};
+
+use env_logger;
+use crate::response::BodyWithTrailers;
+use std::sync::Once;
+use tokio::time::timeout;
+
+static LOGGER_INIT: Once = Once::new();
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -38,6 +47,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 struct ServerConfig {
     bind_address: String,
     tokio_threads: Option<usize>,
+    debug: bool,
+    recv_timeout: u64,
 }
 
 impl ServerConfig {
@@ -45,6 +56,8 @@ impl ServerConfig {
         Self {
             bind_address: String::from("127.0.0.1:3000"),
             tokio_threads: None,
+            debug: false,
+            recv_timeout: 30000, // Default 30 second timeout
         }
     }
 }
@@ -52,8 +65,7 @@ impl ServerConfig {
 // Sent on the work channel with the request, and a oneshot channel to send the response back on.
 struct RequestWithCompletion {
     request: HyperRequest<Bytes>,
-    // sent a response back on this thread
-    response_tx: oneshot::Sender<HyperResponse<Full<Bytes>>>,
+    response_tx: oneshot::Sender<HyperResponse<BodyWithTrailers>>,
 }
 
 #[magnus::wrap(class = "HyperRuby::Server")]
@@ -88,6 +100,23 @@ impl Server {
             server_config.tokio_threads = Some(usize::try_convert(tokio_threads)?);
         }
 
+        if let Some(debug) = config.get(magnus::Symbol::new("debug")) {
+            server_config.debug = bool::try_convert(debug)?;
+        }
+
+        if let Some(recv_timeout) = config.get(magnus::Symbol::new("recv_timeout")) {
+            server_config.recv_timeout = u64::try_convert(recv_timeout)?;
+        }
+
+        // Initialize logging if debug is enabled, but only do it once
+        if server_config.debug {
+            LOGGER_INIT.call_once(|| {
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("hyper=debug,h2=debug"))
+                    .write_style(env_logger::WriteStyle::Always)
+                    .init();
+            });
+        }
+
         Ok(())
     }
 
@@ -108,26 +137,54 @@ impl Server {
                     }
                 };
 
-                 match work_request {
+                match work_request {
                     Ok(work_request) => {
-                        let request = Request {
-                            request: work_request.request,
+                        let hyper_request = work_request.request;
+                        
+                        debug!("Processing request:");
+                        debug!("  Method: {}", hyper_request.method());
+                        debug!("  Path: {}", hyper_request.uri().path());
+                        debug!("  Headers: {:?}", hyper_request.headers());
+                        
+                        // Convert to appropriate request type
+                        let value = if grpc::is_grpc_request(&hyper_request) {
+                            debug!("Request identified as gRPC");
+                            if let Some(grpc_request) = GrpcRequest::new(hyper_request) {
+                                grpc_request.into_value()
+                            } else {
+                                warn!("Failed to create GrpcRequest");
+                                // Invalid gRPC request path
+                                let response = GrpcResponse::error(3_u32.into_value(), RString::new("Invalid gRPC request path")).unwrap()
+                                    .into_hyper_response();
+                                work_request.response_tx.send(response).unwrap_or_else(|e| warn!("Failed to send response: {:?}", e));
+                                continue;
+                            }
+                        } else {
+                            debug!("Request identified as HTTP");
+                            Request::new(hyper_request).into_value()
                         };
-                        let value = request.into_value();
+
                         let hyper_response = match block.call::<_, Value>([value]) {
                             Ok(result) => {
-                                let ref_response = Obj::<Response>::try_convert(result).unwrap();
-                                ref_response.response.clone()
+                                // Try to convert to either Response or GrpcResponse
+                                if let Ok(grpc_response) = Obj::<GrpcResponse>::try_convert(result) {
+                                    (*grpc_response).clone().into_hyper_response()
+                                } else if let Ok(http_response) = Obj::<Response>::try_convert(result) {
+                                    (*http_response).clone().into_hyper_response()
+                                } else {
+                                    warn!("Block returned invalid response type");
+                                    create_error_response("Internal server error")
+                                }
                             },
                             Err(e) => {
-                                println!("Block call failed: {:?}", e);
+                                warn!("Block call failed: {:?}", e);
                                 create_error_response("Internal server error")
                             }
                         };
 
                         match work_request.response_tx.send(hyper_response) {
                             Ok(_) => (),
-                            Err(e) => println!("Failed to send response: {:?}", e),
+                            Err(e) => warn!("Failed to send response: {:?}", e),
                         }
                     }
                     Err(_) => {
@@ -165,6 +222,8 @@ impl Server {
             let work_tx = work_tx.clone();
             
             let server_task = tokio::spawn(async move {
+                let timer = hyper_util::rt::TokioTimer::new();
+
                 if config.bind_address.starts_with("unix:") {
                     let path = config.bind_address.trim_start_matches("unix:");
                     let listener = UnixListener::bind(path).unwrap();
@@ -172,9 +231,10 @@ impl Server {
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
                         let work_tx = work_tx.clone();
+                        let timer = timer.clone();
 
                         tokio::task::spawn(async move {
-                            handle_connection(stream, work_tx).await;
+                            handle_connection(stream, work_tx, config.recv_timeout, timer).await;
                         });
                     }
                 } else {
@@ -185,9 +245,10 @@ impl Server {
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
                         let work_tx = work_tx.clone();
+                        let timer = timer.clone();
 
                         tokio::task::spawn(async move {
-                            handle_connection(stream, work_tx).await;
+                            handle_connection(stream, work_tx, config.recv_timeout, timer).await;
                         });
                     }
                 }
@@ -221,7 +282,7 @@ impl Server {
         if bind_address.starts_with("unix:") {
             let path = bind_address.trim_start_matches("unix:");
             std::fs::remove_file(path).unwrap_or_else(|e| {
-                println!("Failed to remove socket file: {:?}", e);
+                warn!("Failed to remove socket file: {:?}", e);
             });
         }
 
@@ -229,58 +290,124 @@ impl Server {
     }
 }
 
-
-// Helper function to create error responses
-fn create_error_response(error_message: &str) -> HyperResponse<Full<Bytes>> {
-    HyperResponse::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(format!(r#"{{"error": "{}"}}"#, error_message))))
-        .unwrap()
-}
-
 async fn handle_request(
     req: HyperRequest<Incoming>,
     work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
-) -> Result<HyperResponse<Full<Bytes>>, Error> {
+    recv_timeout: u64,
+) -> Result<HyperResponse<BodyWithTrailers>, Error> {
+    debug!("Received request: {:?}", req);
+    debug!("HTTP version: {:?}", req.version());
+    debug!("Headers: {:?}", req.headers());
 
     let (parts, body) = req.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
+    
+    // Collect the body with timeout
+    let body_bytes = match timeout(
+        std::time::Duration::from_millis(recv_timeout),
+        body.collect()
+    ).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(e)) => {
+            debug!("Error collecting body: {:?}", e);
+            return Err(e);
+        },
+        Err(_) => {
+            debug!("Timeout collecting body");
+            return Ok(create_timeout_response());
+        }
+    };
+    
+    debug!("Collected body size: {}", body_bytes.len());
+
+    let hyper_request = HyperRequest::from_parts(parts, body_bytes);
+    let is_grpc = grpc::is_grpc_request(&hyper_request);
+    debug!("Is gRPC: {}", is_grpc);
 
     let (response_tx, response_rx) = oneshot::channel();
 
     let with_completion = RequestWithCompletion {
-        request: HyperRequest::from_parts(parts, body_bytes),
+        request: hyper_request,
         response_tx,
     };
 
     if work_tx.send(with_completion).is_err() {
-        return Ok(create_error_response("Failed to process request"));
+        warn!("Failed to send request to worker");
+        return Ok(if is_grpc {
+            grpc::create_grpc_error_response(500, 13, "Failed to process request")
+        } else {
+            create_error_response("Failed to process request")
+        });
     }
 
     match response_rx.await {
-        Ok(response) => { Ok(response) }        
-        Err(_) => Ok(create_error_response("Failed to get response")),
+        Ok(response) => {
+            debug!("Got response: {:?}", response);
+            Ok(response)
+        }
+        Err(_) => {
+            warn!("Failed to receive response from worker");
+            Ok(if is_grpc {
+                grpc::create_grpc_error_response(500, 13, "Failed to get response")
+            } else {
+                create_error_response("Failed to get response")
+            })
+        }
     }
+}
+
+fn create_timeout_response() -> HyperResponse<BodyWithTrailers> {
+    let builder = HyperResponse::builder()
+        .status(StatusCode::REQUEST_TIMEOUT)
+        .header("content-type", "text/plain");
+    
+    builder.body(BodyWithTrailers::new(Bytes::from("Request timed out while receiving body"), None))
+        .unwrap()
 }
 
 async fn handle_connection(
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
+    recv_timeout: u64,
+    timer: hyper_util::rt::TokioTimer,
 ) {
+    info!("New connection established");
+    
     let service = service_fn(move |req: HyperRequest<Incoming>| {
+        debug!("Service handling request");
         let work_tx = work_tx.clone();
-        handle_request(req, work_tx)
+        handle_request(req, work_tx, recv_timeout)
     });
 
     let io = TokioIo::new(stream);
     
-    if let Err(err) = auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+    debug!("Setting up connection");
+    let mut builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+
+    builder.http1()
+           .header_read_timeout(std::time::Duration::from_millis(recv_timeout))
+           .timer(timer.clone());
+
+    builder.http2()
+           .keep_alive_interval(std::time::Duration::from_secs(10))
+           .timer(timer);
+
+    if let Err(err) = builder
         .serve_connection(io, service)
         .await
     {
-        eprintln!("Error serving connection: {:?}", err);
+        warn!("Error serving connection: {:?}", err);
     }
+}
+
+// Helper function to create error responses
+fn create_error_response(error_message: &str) -> HyperResponse<BodyWithTrailers> {
+    // For non-gRPC requests, return a plain HTTP error
+    let builder = HyperResponse::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "text/plain");
+    
+    builder.body(BodyWithTrailers::new(Bytes::from(error_message.to_string()), None))
+        .unwrap()
 }
 
 #[magnus::init]
@@ -300,14 +427,33 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     response_class.define_method("headers", method!(Response::headers, 0))?;
     response_class.define_method("body", method!(Response::body, 0))?;
 
+    let grpc_response_class = module.define_class("GrpcResponse", ruby.class_object())?;
+    grpc_response_class.define_singleton_method("new", function!(GrpcResponse::new, 2))?;
+    grpc_response_class.define_singleton_method("error", function!(GrpcResponse::error, 2))?;
+    grpc_response_class.define_method("status", method!(GrpcResponse::status, 0))?;
+    grpc_response_class.define_method("headers", method!(GrpcResponse::headers, 0))?;
+    grpc_response_class.define_method("body", method!(GrpcResponse::body, 0))?;
+
     let request_class = module.define_class("Request", ruby.class_object())?;
     request_class.define_method("http_method", method!(Request::method, 0))?;
     request_class.define_method("path", method!(Request::path, 0))?;
     request_class.define_method("header", method!(Request::header, 1))?;
+    request_class.define_method("headers", method!(Request::headers, 0))?;
     request_class.define_method("body", method!(Request::body, 0))?;
     request_class.define_method("fill_body", method!(Request::fill_body, 1))?;
     request_class.define_method("body_size", method!(Request::body_size, 0))?;
     request_class.define_method("inspect", method!(Request::inspect, 0))?;
+
+    let grpc_request_class = module.define_class("GrpcRequest", ruby.class_object())?;
+    grpc_request_class.define_method("service", method!(GrpcRequest::service, 0))?;
+    grpc_request_class.define_method("method", method!(GrpcRequest::method, 0))?;
+    grpc_request_class.define_method("header", method!(GrpcRequest::header, 1))?;
+    grpc_request_class.define_method("headers", method!(GrpcRequest::headers, 0))?;
+    grpc_request_class.define_method("body", method!(GrpcRequest::body, 0))?;
+    grpc_request_class.define_method("fill_body", method!(GrpcRequest::fill_body, 1))?;
+    grpc_request_class.define_method("body_size", method!(GrpcRequest::body_size, 0))?;
+    grpc_request_class.define_method("compressed?", method!(GrpcRequest::is_compressed, 0))?;
+    grpc_request_class.define_method("inspect", method!(GrpcRequest::inspect, 0))?;
 
     Ok(())
 }

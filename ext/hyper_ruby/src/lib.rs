@@ -37,10 +37,6 @@ use env_logger;
 use crate::response::BodyWithTrailers;
 use std::sync::Once;
 use tokio::time::timeout;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::time::{Sleep, sleep};
 
 static LOGGER_INIT: Once = Once::new();
 

@@ -65,7 +65,7 @@ pub fn is_grpc_request(request: &HyperRequest<Bytes>) -> bool {
     true
 }
 
-pub fn decode_grpc_frame(bytes: &[u8]) -> Option<Bytes> {
+pub fn decode_grpc_frame(bytes: &Bytes) -> Option<(bool, Bytes)> {
     if bytes.len() < GRPC_HEADER_SIZE {
         return None;
     }
@@ -73,17 +73,12 @@ pub fn decode_grpc_frame(bytes: &[u8]) -> Option<Bytes> {
     // GRPC frame format:
     // Compressed-Flag (1 byte) | Message-Length (4 bytes) | Message
     let compressed = bytes[0] != 0;
-    if compressed {
-        // We don't support compression yet
-        return None;
-    }
-
     let message_len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
     if bytes.len() < GRPC_HEADER_SIZE + message_len {
         return None;
     }
 
-    Some(Bytes::copy_from_slice(&bytes[GRPC_HEADER_SIZE..GRPC_HEADER_SIZE + message_len]))
+    Some((compressed, bytes.slice(GRPC_HEADER_SIZE..GRPC_HEADER_SIZE + message_len)))
 }
 
 pub fn encode_grpc_frame(message: &[u8]) -> Bytes {

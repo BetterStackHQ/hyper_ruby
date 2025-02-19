@@ -194,7 +194,7 @@ impl GrpcResponse {
     pub fn body(&self) -> RString {
         // For gRPC responses, decode the frame
         let body = self.response.body().get_data();
-        if let Some(message) = grpc::decode_grpc_frame(body) {
+        if let Some((_, message)) = grpc::decode_grpc_frame(body) {
             RString::from_slice(message.as_ref())
         } else {
             RString::new("")

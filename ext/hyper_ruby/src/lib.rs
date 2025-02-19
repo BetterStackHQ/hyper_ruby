@@ -452,6 +452,7 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     grpc_request_class.define_method("body", method!(GrpcRequest::body, 0))?;
     grpc_request_class.define_method("fill_body", method!(GrpcRequest::fill_body, 1))?;
     grpc_request_class.define_method("body_size", method!(GrpcRequest::body_size, 0))?;
+    grpc_request_class.define_method("compressed?", method!(GrpcRequest::is_compressed, 0))?;
     grpc_request_class.define_method("inspect", method!(GrpcRequest::inspect, 0))?;
 
     Ok(())

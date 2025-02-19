@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require 'zlib'
 require_relative "echo_pb"
 require_relative "echo_services_pb"
+
 
 class TestGrpc < HyperRubyTest
   def test_grpc_request
@@ -129,6 +131,28 @@ class TestGrpc < HyperRubyTest
     end
   end
 
+  def test_grpc_compression
+    buffer = String.new(capacity: 1024)
+    compression_options = GRPC::Core::CompressionOptions.new(default_algorithm: :gzip)
+    compression_channel_args = compression_options.to_channel_arg_hash
+
+    with_server(-> (request) { handler_grpc_compressed(request, buffer) }) do |_client|
+      stub = Echo::Echo::Stub.new(
+        "127.0.0.1:3010",
+        :this_channel_is_insecure,
+        channel_args: {
+          'grpc.enable_http_proxy' => 0,
+        }.merge(compression_channel_args)
+      )
+      
+      request = Echo::EchoRequest.new(message: "Hello Compressed GRPC " + ("a" * 10000))
+      response = stub.echo(request)
+      
+      assert_instance_of Echo::EchoResponse, response
+      assert_equal "Decompressed: Hello Compressed GRPC " + ("a" * 10000), response.message
+    end
+  end
+
   private
 
   def handler_grpc(request, buffer)
@@ -184,5 +208,27 @@ class TestGrpc < HyperRubyTest
     else
       HyperRuby::GrpcResponse.error(2, "unknown error") # UNKNOWN = 2
     end
+  end
+
+  def handler_grpc_compressed(request, buffer)
+    assert_equal "application/grpc", request.header("content-type")
+    assert_equal "echo.Echo", request.service
+    assert_equal "Echo", request.method
+    # Check if the message is compressed
+    assert request.compressed?, "Expected request to be compressed"
+    
+    # Get the compressed message
+    request.fill_body(buffer)
+    
+    decompressed = Zlib.gunzip(buffer)
+    echo_request = Echo::EchoRequest.decode(decompressed)
+    
+    echo_response = Echo::EchoResponse.new(message: "Decompressed: #{echo_request.message}")
+    response_data = Echo::EchoResponse.encode(echo_response)
+    
+    HyperRuby::GrpcResponse.new(0, response_data)
+  rescue => e
+    pp e
+    raise e
   end
 end 

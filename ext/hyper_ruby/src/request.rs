@@ -75,11 +75,15 @@ impl FillBuffer for Request {
 
 impl FillBuffer for GrpcRequest {
     fn get_body_bytes(&self) -> Bytes {
-        grpc::decode_grpc_frame(self.request.body()).unwrap_or_else(|| Bytes::new())
+        if let Some((_, message)) = grpc::decode_grpc_frame(self.request.body()) {
+            message
+        } else {
+            Bytes::new()
+        }
     }
 
     fn get_body_size(&self) -> usize {
-        if let Some(message) = grpc::decode_grpc_frame(self.request.body()) {
+        if let Some((_, message)) = grpc::decode_grpc_frame(self.request.body()) {
             message.len()
         } else {
             0
@@ -215,6 +219,14 @@ impl GrpcRequest {
 
     pub fn fill_body(&self, buffer: RString) -> i64 {
         self.fill_buffer(buffer)
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        if let Some((compressed, _)) = grpc::decode_grpc_frame(self.request.body()) {
+            compressed
+        } else {
+            false
+        }
     }
 
     pub fn inspect(&self) -> RString {

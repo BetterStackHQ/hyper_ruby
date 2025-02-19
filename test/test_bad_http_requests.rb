@@ -104,20 +104,24 @@ class TestBadHttpRequests < HyperRubyTest
       
       # Sleep longer than the timeout
       sleep 1.5
-      
-      # Try to send the rest of the headers, but the connection should be closed
-      socket.write("Content-Length: 0\r\n")
-      socket.write("Connection: close\r\n")
-      socket.write("\r\n")
-      
-      # Attempt to read response - should be a timeout or connection closed
-      response = read_http_response(socket)
-      socket.close
-      
-      # The server might respond with a 408 timeout, or might just close the connection
-      # Both behaviors are acceptable according to HTTP/1.1 spec
-      if response[:status]
-        assert_equal 408, response[:status].split(" ")[1].to_i  # Request Timeout if we got a response
+      begin
+        # Try to send the rest of the headers, but the connection should be closed
+        socket.write("Content-Length: 0\r\n")
+        socket.write("Connection: close\r\n")
+        socket.write("\r\n")
+        
+        # Attempt to read response - should be a timeout or connection closed
+        response = read_http_response(socket)
+        socket.close
+        
+        # The server might respond with a 408 timeout, or might just close the connection
+        # Both behaviors are acceptable according to HTTP/1.1 spec
+        if response[:status]
+          assert_equal 408, response[:status].split(" ")[1].to_i  # Request Timeout if we got a response
+        end
+      rescue Errno::EPIPE
+      # This is expected if the server closes the connection due to timeout/error
+      # This is not an error, so we don't need to assert anything
       end
     end
   end

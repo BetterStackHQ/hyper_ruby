@@ -108,14 +108,21 @@ impl Server {
             server_config.recv_timeout = u64::try_convert(recv_timeout)?;
         }
 
-        // Initialize logging if debug is enabled, but only do it once
-        if server_config.debug {
-            LOGGER_INIT.call_once(|| {
-                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("hyper=debug,h2=debug"))
-                    .write_style(env_logger::WriteStyle::Always)
-                    .init();
-            });
-        }
+        // Initialize logging if not already initialized
+        LOGGER_INIT.call_once(|| {
+            let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
+            
+            // Always enable warn and error levels
+            builder.filter_level(log::LevelFilter::Warn);
+            
+            // If debug is enabled, show all log levels
+            if server_config.debug {
+                builder.filter_level(log::LevelFilter::Debug);
+            }
+            
+            builder.write_style(env_logger::WriteStyle::Always)
+                .init();
+        });
 
         Ok(())
     }

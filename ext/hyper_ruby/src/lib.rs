@@ -3,6 +3,7 @@ mod response;
 mod gvl_helpers;
 mod grpc;
 
+use hyper_util::server::graceful::GracefulShutdown;
 use request::{Request, GrpcRequest};
 use response::{Response, GrpcResponse};
 use gvl_helpers::nogvl;
@@ -11,11 +12,12 @@ use magnus::block::block_proc;
 use magnus::typed_data::Obj;
 use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value, RString};
 use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
 
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
@@ -31,17 +33,44 @@ use http_body_util::BodyExt;
 
 use jemallocator::Jemalloc;
 
-use log::{debug, info, warn};
+use log::{debug, info, warn, error};
 
 use env_logger;
 use crate::response::BodyWithTrailers;
 use std::sync::Once;
 use tokio::time::timeout;
 
+use std::io;
+
+use tokio::sync::broadcast;
+
 static LOGGER_INIT: Once = Once::new();
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+enum Listener {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+impl Listener {
+    async fn accept(&self) -> io::Result<(Box<dyn AsyncStream>, SocketAddr)> {
+        match self {
+            Listener::Unix(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok((Box::new(stream), "0.0.0.0:0".parse().unwrap()))
+            }
+            Listener::Tcp(l) => {
+                let (stream, addr) = l.accept().await?;
+                Ok((Box::new(stream), addr))
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ServerConfig {
@@ -75,18 +104,19 @@ struct Server {
     work_rx: RefCell<Option<crossbeam_channel::Receiver<RequestWithCompletion>>>,
     work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<RequestWithCompletion>>>>,
     runtime: RefCell<Option<Arc<tokio::runtime::Runtime>>>,
+    shutdown: RefCell<Option<broadcast::Sender<()>>>,
 }
 
 impl Server {
     pub fn new() -> Self {
         let (work_tx, work_rx) = crossbeam_channel::bounded(1000);
-        
         Self {
             server_handle: Arc::new(Mutex::new(None)),
             config: RefCell::new(ServerConfig::new()),
             work_rx: RefCell::new(Some(work_rx)),
             work_tx: RefCell::new(Some(Arc::new(work_tx))),
             runtime: RefCell::new(None),
+            shutdown: RefCell::new(None),
         }
     }
 
@@ -211,6 +241,9 @@ impl Server {
             .ok_or_else(|| MagnusError::new(magnus::exception::runtime_error(), "Work channel not initialized"))?
             .clone();
 
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        *self.shutdown.borrow_mut() = Some(shutdown_tx);
+
         let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
             
         rt_builder.enable_all();
@@ -225,58 +258,86 @@ impl Server {
 
         *self.runtime.borrow_mut() = Some(rt.clone());
 
-        rt.block_on(async {
-            let work_tx = work_tx.clone();
-            
+
+        rt.block_on(async move {
             let server_task = tokio::spawn(async move {
                 let timer = hyper_util::rt::TokioTimer::new();
+                let mut builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                builder.http1()
+                    .header_read_timeout(std::time::Duration::from_millis(config.recv_timeout))
+                    .timer(timer.clone());
+                builder.http2()
+                    .keep_alive_interval(std::time::Duration::from_secs(10))
+                    .timer(timer);
 
-                if config.bind_address.starts_with("unix:") {
-                    let path = config.bind_address.trim_start_matches("unix:");
-                    let listener = UnixListener::bind(path).unwrap();
-
-                    loop {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        let work_tx = work_tx.clone();
-                        let timer = timer.clone();
-
-                        tokio::task::spawn(async move {
-                            handle_connection(stream, work_tx, config.recv_timeout, timer).await;
-                        });
-                    }
+                let listener = if config.bind_address.starts_with("unix:") {
+                    Listener::Unix(UnixListener::bind(config.bind_address.trim_start_matches("unix:")).unwrap())
                 } else {
-                    let addr: SocketAddr = config.bind_address.parse()
-                        .expect("invalid address format");
-                    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                    let addr: SocketAddr = config.bind_address.parse().expect("invalid address format");
+                    Listener::Tcp(TcpListener::bind(addr).await.unwrap())
+                };
 
-                    loop {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        let work_tx = work_tx.clone();
-                        let timer = timer.clone();
+                let graceful_shutdown = GracefulShutdown::new();
+                let mut shutdown_rx = shutdown_rx;
 
-                        tokio::task::spawn(async move {
-                            handle_connection(stream, work_tx, config.recv_timeout, timer).await;
-                        });
+                loop {
+                    tokio::select! {
+                        Ok((stream, _)) = listener.accept() => {                            
+                            info!("New connection established");
+                            
+                            let io = TokioIo::new(stream);
+                            
+                            debug!("Setting up connection");
+
+                            let builder = builder.clone();
+                            let work_tx = work_tx.clone();
+                            let conn = builder.serve_connection(io, service_fn(move |req: HyperRequest<Incoming>| {
+                                debug!("Service handling request");
+                                handle_request(req, work_tx.clone(), config.recv_timeout)
+                            }));
+                            let fut = graceful_shutdown.watch(conn.into_owned());
+                            tokio::task::spawn(async move {
+                                if let Err(err) = fut.await {
+                                    warn!("Error serving connection: {:?}", err);
+                                }
+                            });
+                        },                        
+                        _ = shutdown_rx.recv() => {
+                            debug!("Graceful shutdown requested; shutting down");
+                            break;
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    _ = graceful_shutdown.shutdown() => {
+                        debug!("all connections gracefully closed");
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                        error!("timed out wait for all connections to close");
                     }
                 }
             });
 
             let mut handle = self.server_handle.lock().await;
             *handle = Some(server_task);
-            
+
             Ok::<(), MagnusError>(())
         })?;
-
+            
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), MagnusError> {
-        // Use the stored runtime instead of creating a new one
         if let Some(rt) = self.runtime.borrow().as_ref() {
+            if let Some(shutdown) = self.shutdown.borrow().as_ref() {
+                let _ = shutdown.send(());
+            }
+
             rt.block_on(async {
                 let mut handle = self.server_handle.lock().await;
                 if let Some(task) = handle.take() {
-                    task.abort();
+                    task.await.unwrap_or_else(|e| warn!("Server task failed: {:?}", e));
                 }
             });
         }
@@ -284,6 +345,7 @@ impl Server {
         // Drop the channel and runtime
         self.work_tx.borrow_mut().take();
         self.runtime.borrow_mut().take();
+        self.shutdown.borrow_mut().take();
 
         let bind_address = self.config.borrow().bind_address.clone();
         if bind_address.starts_with("unix:") {
@@ -369,41 +431,6 @@ fn create_timeout_response() -> HyperResponse<BodyWithTrailers> {
     
     builder.body(BodyWithTrailers::new(Bytes::from("Request timed out while receiving body"), None))
         .unwrap()
-}
-
-async fn handle_connection(
-    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
-    recv_timeout: u64,
-    timer: hyper_util::rt::TokioTimer,
-) {
-    info!("New connection established");
-    
-    let service = service_fn(move |req: HyperRequest<Incoming>| {
-        debug!("Service handling request");
-        let work_tx = work_tx.clone();
-        handle_request(req, work_tx, recv_timeout)
-    });
-
-    let io = TokioIo::new(stream);
-    
-    debug!("Setting up connection");
-    let mut builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-
-    builder.http1()
-           .header_read_timeout(std::time::Duration::from_millis(recv_timeout))
-           .timer(timer.clone());
-
-    builder.http2()
-           .keep_alive_interval(std::time::Duration::from_secs(10))
-           .timer(timer);
-
-    if let Err(err) = builder
-        .serve_connection(io, service)
-        .await
-    {
-        warn!("Error serving connection: {:?}", err);
-    }
 }
 
 // Helper function to create error responses

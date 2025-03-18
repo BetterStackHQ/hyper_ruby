@@ -20,6 +20,12 @@ server.configure(config)
 
 puts "Starting server with config: #{config}"
 
+accept_response = HyperRuby::Response.new(
+  200,
+  { "Content-Type" => "application/json" },
+  { "message" => "Accepted" }.to_json
+)
+
 # Start the server
 server.start
 
@@ -28,26 +34,15 @@ puts "Server started"
 # Create a worker thread to handle requests
 worker = Thread.new do
   server.run_worker do |request|
+    # read the body into a buffer, to simulate some work
     buffer = String.new(capacity: 1024)
     request.fill_body(buffer)
 
-    # Create a response that echoes back request details
-    response_data = {
-      method: request.http_method,
-      path: request.path,
-      headers: request.headers,
-      body: buffer
-    }
-
-    HyperRuby::Response.new(
-      200,
-      { "Content-Type" => "application/json" },
-      JSON.pretty_generate(response_data)
-    )
+    accept_response
   end
 end
 
-puts "Server running at #{server.config.bind_address}"
+puts "Server running at #{config[:bind_address]}"
 puts "Press Ctrl+C to stop"
 
 # Wait for Ctrl+C

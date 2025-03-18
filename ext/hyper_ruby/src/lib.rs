@@ -260,23 +260,72 @@ impl Server {
 
 
         rt.block_on(async move {
+            // Instead of spawning a task, we'll run the server setup inline first to catch binding errors
+            // Setup listener and http server components
+            let timer = hyper_util::rt::TokioTimer::new();
+            let mut builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            builder.http1()
+                .header_read_timeout(std::time::Duration::from_millis(config.recv_timeout))
+                .timer(timer.clone());
+            builder.http2()
+                .keep_alive_interval(std::time::Duration::from_secs(10))
+                .timer(timer);
+
+            // Create the listener with proper error handling
+            let listener = if config.bind_address.starts_with("unix:") {
+                let path = config.bind_address.trim_start_matches("unix:");
+                
+                // Check if the socket file already exists and try to delete it
+                if std::path::Path::new(path).exists() {
+                    debug!("Unix socket file {} already exists, attempting to remove it", path);
+                    match std::fs::remove_file(path) {
+                        Ok(_) => debug!("Successfully removed existing socket file"),
+                        Err(e) => {
+                            error!("Failed to remove existing Unix socket file {}: {}", path, e);
+                            return Err(MagnusError::new(
+                                magnus::exception::runtime_error(),
+                                format!("Failed to remove existing Unix socket file {}: {}", path, e)
+                            ));
+                        }
+                    }
+                }
+                
+                match UnixListener::bind(path) {
+                    Ok(listener) => Listener::Unix(listener),
+                    Err(e) => {
+                        error!("Failed to bind to Unix socket {}: {}", path, e);
+                        return Err(MagnusError::new(
+                            magnus::exception::runtime_error(),
+                            format!("Failed to bind to Unix socket {}: {}", path, e)
+                        ));
+                    }
+                }
+            } else {
+                match config.bind_address.parse::<SocketAddr>() {
+                    Ok(addr) => {
+                        match TcpListener::bind(addr).await {
+                            Ok(listener) => Listener::Tcp(listener),
+                            Err(e) => {
+                                error!("Failed to bind to address {}: {}", addr, e);
+                                return Err(MagnusError::new(
+                                    magnus::exception::runtime_error(),
+                                    format!("Failed to bind to address {}: {}", addr, e)
+                                ));
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        error!("Invalid address format {}: {}", config.bind_address, e);
+                        return Err(MagnusError::new(
+                            magnus::exception::runtime_error(),
+                            format!("Invalid address format {}: {}", config.bind_address, e)
+                        ));
+                    }
+                }
+            };
+
+            // Now that we have successfully bound, spawn the server task
             let server_task = tokio::spawn(async move {
-                let timer = hyper_util::rt::TokioTimer::new();
-                let mut builder = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-                builder.http1()
-                    .header_read_timeout(std::time::Duration::from_millis(config.recv_timeout))
-                    .timer(timer.clone());
-                builder.http2()
-                    .keep_alive_interval(std::time::Duration::from_secs(10))
-                    .timer(timer);
-
-                let listener = if config.bind_address.starts_with("unix:") {
-                    Listener::Unix(UnixListener::bind(config.bind_address.trim_start_matches("unix:")).unwrap())
-                } else {
-                    let addr: SocketAddr = config.bind_address.parse().expect("invalid address format");
-                    Listener::Tcp(TcpListener::bind(addr).await.unwrap())
-                };
-
                 let graceful_shutdown = GracefulShutdown::new();
                 let mut shutdown_rx = shutdown_rx;
 

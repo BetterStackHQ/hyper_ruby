@@ -202,11 +202,11 @@ impl Server {
                             if let Some(grpc_request) = GrpcRequest::new(hyper_request) {
                                 grpc_request.into_value()
                             } else {
-                                warn!("Failed to create GrpcRequest");
+                                error!("Failed to create GrpcRequest due to invalid path - returning gRPC error");
                                 // Invalid gRPC request path
                                 let response = GrpcResponse::error(3_u32.into_value(), RString::new("Invalid gRPC request path")).unwrap()
                                     .into_hyper_response();
-                                work_request.response_tx.send(response).unwrap_or_else(|e| warn!("Failed to send response: {:?}", e));
+                                work_request.response_tx.send(response).unwrap_or_else(|e| error!("Failed to send response: {:?}", e));
                                 continue;
                             }
                         } else {
@@ -222,19 +222,19 @@ impl Server {
                                 } else if let Ok(http_response) = Obj::<Response>::try_convert(result) {
                                     (*http_response).clone().into_hyper_response()
                                 } else {
-                                    warn!("Block returned invalid response type");
+                                    error!("Block returned invalid response type - returning 500 Internal Server Error");
                                     create_error_response("Internal server error")
                                 }
                             },
                             Err(e) => {
-                                warn!("Block call failed: {:?}", e);
+                                error!("Block call failed with error: {:?} - returning 500 Internal Server Error", e);
                                 create_error_response("Internal server error")
                             }
                         };
 
                         match work_request.response_tx.send(hyper_response) {
                             Ok(_) => (),
-                            Err(e) => warn!("Failed to send response: {:?}", e),
+                            Err(e) => error!("Failed to send response back to client: {:?} - response dropped", e),
                         }
                     }
                     Err(_) => {
@@ -493,7 +493,7 @@ async fn handle_request(
                     });
                 },
                 Ok(Err(crossbeam_channel::SendTimeoutError::Disconnected(_))) => {
-                    warn!("Worker channel disconnected");
+                    error!("Worker channel disconnected - server is shutting down, returning 500");
                     return Ok(if is_grpc {
                         grpc::create_grpc_error_response(500, 13, "Server shutting down")
                     } else {
@@ -501,7 +501,7 @@ async fn handle_request(
                     });
                 },
                 Err(_) => {
-                    warn!("Task to send request failed");
+                    error!("Task to send request failed - returning 500 Internal Server Error");
                     return Ok(if is_grpc {
                         grpc::create_grpc_error_response(500, 13, "Internal server error")
                     } else {
@@ -511,7 +511,7 @@ async fn handle_request(
             }
         },
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-            warn!("Worker channel disconnected");
+            error!("Worker channel disconnected - server is shutting down, returning 500");
             return Ok(if is_grpc {
                 grpc::create_grpc_error_response(500, 13, "Server shutting down")
             } else {
@@ -526,7 +526,7 @@ async fn handle_request(
             Ok(response)
         }
         Err(_) => {
-            warn!("Failed to receive response from worker");
+            error!("Failed to receive response from worker - returning 500 Internal Server Error");
             Ok(if is_grpc {
                 grpc::create_grpc_error_response(500, 13, "Failed to get response")
             } else {

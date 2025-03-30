@@ -78,6 +78,8 @@ struct ServerConfig {
     tokio_threads: Option<usize>,
     debug: bool,
     recv_timeout: u64,
+    channel_capacity: usize,
+    send_timeout: u64,
 }
 
 impl ServerConfig {
@@ -87,6 +89,8 @@ impl ServerConfig {
             tokio_threads: None,
             debug: false,
             recv_timeout: 30000, // Default 30 second timeout
+            channel_capacity: 5000, // Default capacity for worker channel
+            send_timeout: 1000, // Default 1 second timeout for send backpressure
         }
     }
 }
@@ -109,10 +113,11 @@ struct Server {
 
 impl Server {
     pub fn new() -> Self {
-        let (work_tx, work_rx) = crossbeam_channel::bounded(1000);
+        let config = ServerConfig::new();
+        let (work_tx, work_rx) = crossbeam_channel::bounded(config.channel_capacity);
         Self {
             server_handle: Arc::new(Mutex::new(None)),
-            config: RefCell::new(ServerConfig::new()),
+            config: RefCell::new(config),
             work_rx: RefCell::new(Some(work_rx)),
             work_tx: RefCell::new(Some(Arc::new(work_tx))),
             runtime: RefCell::new(None),
@@ -136,6 +141,14 @@ impl Server {
 
         if let Some(recv_timeout) = config.get(magnus::Symbol::new("recv_timeout")) {
             server_config.recv_timeout = u64::try_convert(recv_timeout)?;
+        }
+
+        if let Some(channel_capacity) = config.get(magnus::Symbol::new("channel_capacity")) {
+            server_config.channel_capacity = usize::try_convert(channel_capacity)?;
+        }
+        
+        if let Some(send_timeout) = config.get(magnus::Symbol::new("send_timeout")) {
+            server_config.send_timeout = u64::try_convert(send_timeout)?;
         }
 
         // Initialize logging if not already initialized
@@ -342,7 +355,7 @@ impl Server {
                             let work_tx = work_tx.clone();
                             let conn = builder.serve_connection(io, service_fn(move |req: HyperRequest<Incoming>| {
                                 debug!("Service handling request");
-                                handle_request(req, work_tx.clone(), config.recv_timeout)
+                                handle_request(req, work_tx.clone(), config.recv_timeout, config.send_timeout)
                             }));
                             let fut = graceful_shutdown.watch(conn.into_owned());
                             tokio::task::spawn(async move {
@@ -412,6 +425,7 @@ async fn handle_request(
     req: HyperRequest<Incoming>,
     work_tx: Arc<crossbeam_channel::Sender<RequestWithCompletion>>,
     recv_timeout: u64,
+    send_timeout: u64,
 ) -> Result<HyperResponse<BodyWithTrailers>, Error> {
     debug!("Received request: {:?}", req);
     debug!("HTTP version: {:?}", req.version());
@@ -448,13 +462,62 @@ async fn handle_request(
         response_tx,
     };
 
-    if work_tx.send(with_completion).is_err() {
-        warn!("Failed to send request to worker");
-        return Ok(if is_grpc {
-            grpc::create_grpc_error_response(500, 13, "Failed to process request")
-        } else {
-            create_error_response("Failed to process request")
-        });
+    // First try non-blocking send
+    match work_tx.try_send(with_completion) {
+        Ok(()) => {
+            debug!("Successfully queued request (fast path)");
+        },
+        Err(crossbeam_channel::TrySendError::Full(completion)) => {
+            // Channel is full, fall back to blocking send with timeout
+            debug!("Channel full, attempting send with timeout");
+            
+            // Use send_timeout to implement backpressure
+            let send_result = tokio::task::spawn_blocking(move || {
+                work_tx.send_timeout(
+                    completion,
+                    std::time::Duration::from_millis(send_timeout),
+                )
+            }).await;
+
+            match send_result {
+                Ok(Ok(())) => {
+                    debug!("Successfully queued request after timeout wait");
+                },
+                Ok(Err(crossbeam_channel::SendTimeoutError::Timeout(_))) => {
+                    // Timeout waiting for channel space
+                    warn!("Channel full after timeout - returning 429 Too Many Requests");
+                    return Ok(if is_grpc {
+                        grpc::create_grpc_error_response(429, 8, "Server too busy, try again later") // RESOURCE_EXHAUSTED = 8
+                    } else {
+                        create_too_many_requests_response("Server too busy, try again later")
+                    });
+                },
+                Ok(Err(crossbeam_channel::SendTimeoutError::Disconnected(_))) => {
+                    warn!("Worker channel disconnected");
+                    return Ok(if is_grpc {
+                        grpc::create_grpc_error_response(500, 13, "Server shutting down")
+                    } else {
+                        create_error_response("Server shutting down")
+                    });
+                },
+                Err(_) => {
+                    warn!("Task to send request failed");
+                    return Ok(if is_grpc {
+                        grpc::create_grpc_error_response(500, 13, "Internal server error")
+                    } else {
+                        create_error_response("Internal server error")
+                    });
+                }
+            }
+        },
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            warn!("Worker channel disconnected");
+            return Ok(if is_grpc {
+                grpc::create_grpc_error_response(500, 13, "Server shutting down")
+            } else {
+                create_error_response("Server shutting down")
+            });
+        }
     }
 
     match response_rx.await {
@@ -487,6 +550,16 @@ fn create_error_response(error_message: &str) -> HyperResponse<BodyWithTrailers>
     // For non-gRPC requests, return a plain HTTP error
     let builder = HyperResponse::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "text/plain");
+    
+    builder.body(BodyWithTrailers::new(Bytes::from(error_message.to_string()), None))
+        .unwrap()
+}
+
+// Helper function to create too many requests responses
+fn create_too_many_requests_response(error_message: &str) -> HyperResponse<BodyWithTrailers> {
+    let builder = HyperResponse::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
         .header("content-type", "text/plain");
     
     builder.body(BodyWithTrailers::new(Bytes::from(error_message.to_string()), None))

@@ -9,6 +9,7 @@ use rb_sys::{rb_str_set_len, rb_str_modify, rb_str_modify_expand, rb_str_capacit
 
 use crate::grpc;
 use log::debug;
+use form_urlencoded;
 
 // Trait for common buffer filling behavior
 trait FillBuffer {
@@ -104,6 +105,28 @@ impl Request {
         RString::new(self.request.uri().path())
     }
 
+    pub fn query_params(&self) -> RHash {
+        let params = RHash::new();
+        if let Some(query) = self.request.uri().query() {
+            for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+                params.aset(key.to_string(), value.to_string()).unwrap();
+            }
+        }
+        params
+    }
+
+    pub fn query_param(&self, key: RString) -> Value {
+        let key_str = unsafe { key.as_str().unwrap() };
+        if let Some(query) = self.request.uri().query() {
+            for (param_key, value) in form_urlencoded::parse(query.as_bytes()) {
+                if param_key == key_str {
+                    return RString::new(&value).as_value();
+                }
+            }
+        }
+        qnil().as_value()
+    }
+
     pub fn header(&self, key: RString) -> Value {
         let key_str = unsafe { key.as_str().unwrap() };
         match self.request.headers().get(key_str) {
@@ -142,8 +165,11 @@ impl Request {
     pub fn inspect(&self) -> RString {
         let method = self.request.method().to_string();
         let path = self.request.uri().path();
+        let query = self.request.uri().query().unwrap_or("");
+        let query_display = if !query.is_empty() { format!("?{}", query) } else { String::new() };
         let body_size = self.body_size();
-        RString::new(&format!("#<HyperRuby::Request method={} path={} body_size={}>", method, path, body_size))
+        RString::new(&format!("#<HyperRuby::Request method={} path={}{} body_size={}>", 
+            method, path, query_display, body_size))
     }
 }
 

@@ -215,6 +215,32 @@ class TestHttp < HyperRubyTest
     end
   end
 
+  def test_query_params
+    with_server(-> (request) { handler_query_params(request) }) do |client|
+      response = client.get("/?name=John&age=30&verified")
+      assert_equal 200, response.status
+      
+      data = JSON.parse(response.body)
+      assert_equal "John", data["query_params"]["name"]
+      assert_equal "30", data["query_params"]["age"]
+      assert_equal "", data["query_params"]["verified"]
+      
+      assert_equal "John", data["query_param_name"]
+      assert_nil data["query_param_missing"]
+    end
+  end
+  
+  def test_query_params_with_encoding
+    with_server(-> (request) { handler_query_params(request) }) do |client|
+      response = client.get("/?q=hello%20world&filter=type%3Duser")
+      assert_equal 200, response.status
+      
+      data = JSON.parse(response.body)
+      assert_equal "hello world", data["query_params"]["q"]
+      assert_equal "type=user", data["query_params"]["filter"]
+    end
+  end
+
   private
 
   def handler_simple(request)
@@ -241,5 +267,19 @@ class TestHttp < HyperRubyTest
   def handler_accept(request, buffer)
     request.fill_body(buffer)
     ACCEPT_RESPONSE
+  end
+
+  def handler_query_params(request)
+    response_data = {
+      query_params: request.query_params,
+      query_param_name: request.query_param("name"),
+      query_param_missing: request.query_param("missing")
+    }
+    
+    HyperRuby::Response.new(
+      200,
+      { 'Content-Type' => 'application/json' },
+      JSON.generate(response_data)
+    )
   end
 end

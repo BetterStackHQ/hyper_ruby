@@ -114,12 +114,11 @@ struct Server {
 impl Server {
     pub fn new() -> Self {
         let config = ServerConfig::new();
-        let (work_tx, work_rx) = crossbeam_channel::bounded(config.channel_capacity);
         Self {
             server_handle: Arc::new(Mutex::new(None)),
             config: RefCell::new(config),
-            work_rx: RefCell::new(Some(work_rx)),
-            work_tx: RefCell::new(Some(Arc::new(work_tx))),
+            work_rx: RefCell::new(None),
+            work_tx: RefCell::new(None),
             runtime: RefCell::new(None),
             shutdown: RefCell::new(None),
         }
@@ -173,87 +172,96 @@ impl Server {
     // Method that Ruby worker threads will call with a block
     pub fn run_worker(&self) -> Result<(), MagnusError> {
         let block = block_proc().unwrap();
-        if let Some(work_rx) = self.work_rx.borrow().as_ref() {
-           
-            loop {
-                // try getting the next request without yielding the GVL, if there's nothing, wait for one
-                let work_request = match work_rx.try_recv() {
-                    Ok(work_request) => Ok(work_request),
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        nogvl(|| work_rx.recv())
-                    },
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        break;
-                    }
-                };
+        
+        // Check if we have a work_rx channel, error out if not
+        let work_rx = self.work_rx.borrow().as_ref().ok_or_else(|| {
+            MagnusError::new(magnus::exception::runtime_error(), "Server must be started before running workers")
+        })?.clone();
+       
+        loop {
+            // try getting the next request without yielding the GVL, if there's nothing, wait for one
+            let work_request = match work_rx.try_recv() {
+                Ok(work_request) => Ok(work_request),
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    nogvl(|| work_rx.recv())
+                },
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    break;
+                }
+            };
 
-                match work_request {
-                    Ok(work_request) => {
-                        let hyper_request = work_request.request;
-                        
-                        debug!("Processing request:");
-                        debug!("  Method: {}", hyper_request.method());
-                        debug!("  Path: {}", hyper_request.uri().path());
-                        debug!("  Headers: {:?}", hyper_request.headers());
-                        
-                        // Convert to appropriate request type
-                        let value = if grpc::is_grpc_request(&hyper_request) {
-                            debug!("Request identified as gRPC");
-                            if let Some(grpc_request) = GrpcRequest::new(hyper_request) {
-                                grpc_request.into_value()
-                            } else {
-                                error!("Failed to create GrpcRequest due to invalid path - returning gRPC error");
-                                // Invalid gRPC request path
-                                let response = GrpcResponse::error(3_u32.into_value(), RString::new("Invalid gRPC request path")).unwrap()
-                                    .into_hyper_response();
-                                work_request.response_tx.send(response).unwrap_or_else(|e| error!("Failed to send response: {:?}", e));
-                                continue;
-                            }
+            match work_request {
+                Ok(work_request) => {
+                    let hyper_request = work_request.request;
+                    
+                    debug!("Processing request:");
+                    debug!("  Method: {}", hyper_request.method());
+                    debug!("  Path: {}", hyper_request.uri().path());
+                    debug!("  Headers: {:?}", hyper_request.headers());
+                    
+                    // Convert to appropriate request type
+                    let value = if grpc::is_grpc_request(&hyper_request) {
+                        debug!("Request identified as gRPC");
+                        if let Some(grpc_request) = GrpcRequest::new(hyper_request) {
+                            grpc_request.into_value()
                         } else {
-                            debug!("Request identified as HTTP");
-                            Request::new(hyper_request).into_value()
-                        };
+                            error!("Failed to create GrpcRequest due to invalid path - returning gRPC error");
+                            // Invalid gRPC request path
+                            let response = GrpcResponse::error(3_u32.into_value(), RString::new("Invalid gRPC request path")).unwrap()
+                                .into_hyper_response();
+                            work_request.response_tx.send(response).unwrap_or_else(|e| error!("Failed to send response: {:?}", e));
+                            continue;
+                        }
+                    } else {
+                        debug!("Request identified as HTTP");
+                        Request::new(hyper_request).into_value()
+                    };
 
-                        let hyper_response = match block.call::<_, Value>([value]) {
-                            Ok(result) => {
-                                // Try to convert to either Response or GrpcResponse
-                                if let Ok(grpc_response) = Obj::<GrpcResponse>::try_convert(result) {
-                                    (*grpc_response).clone().into_hyper_response()
-                                } else if let Ok(http_response) = Obj::<Response>::try_convert(result) {
-                                    (*http_response).clone().into_hyper_response()
-                                } else {
-                                    error!("Block returned invalid response type - returning 500 Internal Server Error");
-                                    create_error_response("Internal server error")
-                                }
-                            },
-                            Err(e) => {
-                                error!("Block call failed with error: {:?} - returning 500 Internal Server Error", e);
+                    let hyper_response = match block.call::<_, Value>([value]) {
+                        Ok(result) => {
+                            // Try to convert to either Response or GrpcResponse
+                            if let Ok(grpc_response) = Obj::<GrpcResponse>::try_convert(result) {
+                                (*grpc_response).clone().into_hyper_response()
+                            } else if let Ok(http_response) = Obj::<Response>::try_convert(result) {
+                                (*http_response).clone().into_hyper_response()
+                            } else {
+                                error!("Block returned invalid response type - returning 500 Internal Server Error");
                                 create_error_response("Internal server error")
                             }
-                        };
-
-                        match work_request.response_tx.send(hyper_response) {
-                            Ok(_) => (),
-                            Err(e) => error!("Failed to send response back to client: {:?} - response dropped", e),
+                        },
+                        Err(e) => {
+                            error!("Block call failed with error: {:?} - returning 500 Internal Server Error", e);
+                            create_error_response("Internal server error")
                         }
+                    };
+
+                    match work_request.response_tx.send(hyper_response) {
+                        Ok(_) => (),
+                        Err(e) => error!("Failed to send response back to client: {:?} - response dropped", e),
                     }
-                    Err(_) => {
-                        // Channel closed, exit thread
-                        break;
-                    }
+                }
+                Err(_) => {
+                    // Channel closed, exit thread
+                    break;
                 }
             }
         }
+        
         Ok(())
     }
 
     pub fn start(&self) -> Result<(), MagnusError> {
         let config = self.config.borrow().clone();
-        let work_tx = self.work_tx.borrow()
-            .as_ref()
-            .ok_or_else(|| MagnusError::new(magnus::exception::runtime_error(), "Work channel not initialized"))?
-            .clone();
-
+        
+        // Create the channel with the current configuration
+        let (work_tx, work_rx) = crossbeam_channel::bounded(config.channel_capacity);
+        debug!("Created channel with capacity: {}", config.channel_capacity);
+        
+        // Store the channel
+        *self.work_rx.borrow_mut() = Some(work_rx);
+        let work_tx = Arc::new(work_tx);
+        *self.work_tx.borrow_mut() = Some(work_tx.clone());
+        
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         *self.shutdown.borrow_mut() = Some(shutdown_tx);
 
@@ -462,51 +470,58 @@ async fn handle_request(
         response_tx,
     };
 
+    debug!("work_tx capacity: {:?}/{:?}", work_tx.len(), work_tx.capacity());
+
     // First try non-blocking send
     match work_tx.try_send(with_completion) {
         Ok(()) => {
             debug!("Successfully queued request (fast path)");
         },
-        Err(crossbeam_channel::TrySendError::Full(completion)) => {
-            // Channel is full, fall back to blocking send with timeout
-            debug!("Channel full, attempting send with timeout");
+        Err(crossbeam_channel::TrySendError::Full(mut completion)) => {
+            // Channel is full, implement polling with short delays
+            debug!("Channel full, attempting to send with polling");
             
-            // Use send_timeout to implement backpressure
-            let send_result = tokio::task::spawn_blocking(move || {
-                work_tx.send_timeout(
-                    completion,
-                    std::time::Duration::from_millis(send_timeout),
-                )
-            }).await;
-
-            match send_result {
-                Ok(Ok(())) => {
-                    debug!("Successfully queued request after timeout wait");
-                },
-                Ok(Err(crossbeam_channel::SendTimeoutError::Timeout(_))) => {
-                    // Timeout waiting for channel space
+            // Use polling with sleep to implement backpressure
+            let start = std::time::Instant::now();
+            let max_wait = std::time::Duration::from_millis(send_timeout);
+            let delay_ms = 10; // 10ms delay between attempts
+            
+            // Create a new oneshot channel for each attempt to avoid cloning
+            let mut attempts = 0;
+            loop {
+                // Check if we've reached the timeout
+                if start.elapsed() >= max_wait {
                     warn!("Channel full after timeout - returning 429 Too Many Requests");
                     return Ok(if is_grpc {
                         grpc::create_grpc_error_response(429, 8, "Server too busy, try again later") // RESOURCE_EXHAUSTED = 8
                     } else {
                         create_too_many_requests_response("Server too busy, try again later")
                     });
-                },
-                Ok(Err(crossbeam_channel::SendTimeoutError::Disconnected(_))) => {
-                    error!("Worker channel disconnected - server is shutting down, returning 500");
-                    return Ok(if is_grpc {
-                        grpc::create_grpc_error_response(500, 13, "Server shutting down")
-                    } else {
-                        create_error_response("Server shutting down")
-                    });
-                },
-                Err(_) => {
-                    error!("Task to send request failed - returning 500 Internal Server Error");
-                    return Ok(if is_grpc {
-                        grpc::create_grpc_error_response(500, 13, "Internal server error")
-                    } else {
-                        create_error_response("Internal server error")
-                    });
+                }
+                
+                // Sleep for a short delay before trying again
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                
+                // Try to send again
+                attempts += 1;
+                debug!("Retry attempt {} after {}ms", attempts, delay_ms);
+                match work_tx.try_send(completion) {
+                    Ok(()) => {
+                        debug!("Successfully queued request after {} polling attempts", attempts);
+                        break;
+                    },
+                    Err(crossbeam_channel::TrySendError::Full(returned_completion)) => {
+                        // Get our completion request back and try again
+                        completion = returned_completion;
+                    },
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        error!("Worker channel disconnected - server is shutting down, returning 500");
+                        return Ok(if is_grpc {
+                            grpc::create_grpc_error_response(500, 13, "Server shutting down")
+                        } else {
+                            create_error_response("Server shutting down")
+                        });
+                    }
                 }
             }
         },

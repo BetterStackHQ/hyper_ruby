@@ -14,6 +14,9 @@ gem "minitest", "~> 5.0"
 
 gem "httpx", "~> 1.2"
 
+# Testing dependencies
+gem "concurrent-ruby", "~> 1.2"
+
 # gRPC dependencies
 gem "grpc", "~> 1.62"
 gem "grpc-tools", "~> 1.62"

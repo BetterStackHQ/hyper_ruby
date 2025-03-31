@@ -470,8 +470,6 @@ async fn handle_request(
         response_tx,
     };
 
-    debug!("work_tx capacity: {:?}/{:?}", work_tx.len(), work_tx.capacity());
-
     // First try non-blocking send
     match work_tx.try_send(with_completion) {
         Ok(()) => {

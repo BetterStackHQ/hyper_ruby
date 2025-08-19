@@ -105,6 +105,20 @@ impl Request {
         RString::new(self.request.uri().path())
     }
 
+    pub fn host(&self) -> Value {
+        match self.request.uri().host() {
+            Some(host) => RString::new(host).as_value(),
+            // Fallback to Host header if no host in URI object
+            None => match self.request.headers().get("Host") {
+                Some(value) => match value.to_str() {
+                    Ok(value) => RString::new(value).as_value(),
+                    Err(_) => qnil().as_value(),
+                },
+                None => qnil().as_value(),
+            }
+        }
+    }
+
     pub fn query_params(&self) -> RHash {
         let params = RHash::new();
         if let Some(query) = self.request.uri().query() {

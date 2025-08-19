@@ -286,7 +286,6 @@ class TestHttp < HyperRubyTest
   end
 
   def handler_return_host(request)
-    pp request.host()
     HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.host() }.to_json)
   end
 

@@ -608,6 +608,7 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     request_class.define_method("path", method!(Request::path, 0))?;
     request_class.define_method("query_params", method!(Request::query_params, 0))?;
     request_class.define_method("query_param", method!(Request::query_param, 1))?;
+    request_class.define_method("host", method!(Request::host, 0))?;
     request_class.define_method("header", method!(Request::header, 1))?;
     request_class.define_method("headers", method!(Request::headers, 0))?;
     request_class.define_method("body", method!(Request::body, 0))?;

@@ -241,6 +241,35 @@ class TestHttp < HyperRubyTest
     end
   end
 
+  def test_host
+    with_server(-> (request) { handler_return_host(request) }) do |client|
+      response = client.get("/")
+      assert_equal 200, response.status
+      # The Host header should contain the server address
+      host_header = JSON.parse(response.body)["message"]
+      assert_match(/127\.0\.0\.1/, host_header)
+    end
+  end
+
+  def test_http2_host
+    with_server(-> (request) { handler_return_host(request) }) do |client|
+      # Configure client for HTTP/2
+      client = client.with(
+        debug: STDERR,
+        debug_level: 3,
+        fallback_protocol: "h2"
+      )
+      
+      response = client.get("/")
+      assert_equal 200, response.status
+      assert_equal "2.0", response.version
+      
+      # The Host header should contain the server address
+      host_header = JSON.parse(response.body)["message"]
+      assert_match(/127\.0\.0\.1/, host_header)
+    end
+  end
+
   private
 
   def handler_simple(request)
@@ -254,6 +283,11 @@ class TestHttp < HyperRubyTest
   
   def handler_return_header(request, header_key)
     HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.header(header_key) }.to_json)
+  end
+
+  def handler_return_host(request)
+    pp request.host()
+    HyperRuby::Response.new(200, { 'Content-Type' => 'application/json' }, { message: request.host() }.to_json)
   end
 
   def handler_return_all_headers(request)

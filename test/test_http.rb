@@ -270,6 +270,117 @@ class TestHttp < HyperRubyTest
     end
   end
 
+  def test_chunked_transfer_encoding
+    buffer = String.new(capacity: 65536)
+    with_server(-> (request) { handler_to_json(request, buffer) }) do |_client|
+      require 'socket'
+      
+      # Create a large body (64KB) to ensure chunked encoding is meaningful
+      chunk1 = "A" * 16384  # 16KB
+      chunk2 = "B" * 16384  # 16KB
+      chunk3 = "C" * 16384  # 16KB
+      chunk4 = "D" * 16384  # 16KB
+      expected_body = chunk1 + chunk2 + chunk3 + chunk4
+      
+      # Build a raw HTTP/1.1 request with Transfer-Encoding: chunked
+      socket = TCPSocket.new("127.0.0.1", 3010)
+      
+      # Send headers
+      socket.write("POST / HTTP/1.1\r\n")
+      socket.write("Host: 127.0.0.1:3010\r\n")
+      socket.write("Transfer-Encoding: chunked\r\n")
+      socket.write("Content-Type: text/plain\r\n")
+      socket.write("Connection: close\r\n")
+      socket.write("\r\n")
+      
+      # Send body in chunks (chunked encoding format: size in hex, CRLF, data, CRLF)
+      [chunk1, chunk2, chunk3, chunk4].each do |chunk|
+        socket.write("#{chunk.bytesize.to_s(16)}\r\n")
+        socket.write(chunk)
+        socket.write("\r\n")
+      end
+      
+      # Send final zero-length chunk to signal end
+      socket.write("0\r\n")
+      socket.write("\r\n")
+      
+      # Read response
+      response = socket.read
+      socket.close
+      
+      # Parse response - find the JSON body after headers
+      headers_end = response.index("\r\n\r\n")
+      assert headers_end, "Response should have headers"
+      
+      status_line = response.lines.first
+      assert_match(/HTTP\/1\.1 200/, status_line, "Should receive 200 OK")
+      
+      # Extract body after headers
+      body_part = response[(headers_end + 4)..]
+      
+      # Parse the JSON response and verify the body was correctly received
+      json_response = JSON.parse(body_part)
+      received_body = json_response["message"]
+      
+      assert_equal expected_body.bytesize, received_body.bytesize,
+        "Body size should match (expected #{expected_body.bytesize}, got #{received_body.bytesize})"
+      assert_equal expected_body, received_body, "Body content should match"
+    end
+  end
+
+  def test_chunked_transfer_encoding_aborted_connection
+    # Test that when a client aborts (RST) mid-chunked-transfer,
+    # the partial body is NOT exposed to the handler
+    handler_called = false
+
+    server_config = {
+      bind_address: "127.0.0.1:3010",
+      tokio_threads: 1,
+      recv_timeout: 1000  # 1 second timeout
+    }
+
+    with_configured_server(server_config, -> (request) {
+      handler_called = true
+      buffer = String.new(capacity: 65536)
+      request.fill_body(buffer)
+      HyperRuby::Response.new(200, { 'Content-Type' => 'text/plain' }, buffer)
+    }) do |_client|
+      chunk1 = "A" * 16384  # 16KB
+      chunk2 = "B" * 16384  # 16KB
+
+      # Create socket and set SO_LINGER to 0 to send RST on close (abort)
+      socket = Socket.new(Socket::AF_INET, Socket::SOCK_STREAM)
+      socket.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, [1, 0].pack("ii"))
+      socket.connect(Socket.sockaddr_in(3010, "127.0.0.1"))
+
+      # Send headers
+      socket.write("POST / HTTP/1.1\r\n")
+      socket.write("Host: 127.0.0.1:3010\r\n")
+      socket.write("Transfer-Encoding: chunked\r\n")
+      socket.write("Content-Type: text/plain\r\n")
+      socket.write("Connection: close\r\n")
+      socket.write("\r\n")
+
+      # Send first chunk successfully
+      socket.write("#{chunk1.bytesize.to_s(16)}\r\n")
+      socket.write(chunk1)
+      socket.write("\r\n")
+
+      # Send partial second chunk
+      socket.write("#{chunk2.bytesize.to_s(16)}\r\n")
+      socket.write(chunk2[0, 8192])  # Only half of chunk2
+
+      # Abort the connection with RST (no graceful close)
+      socket.close
+
+      # Wait for the server to process and timeout
+      sleep 1.5
+
+      # The handler should NOT have been called since the chunked body was incomplete
+      refute handler_called, "Handler should not be called when chunked transfer is aborted mid-stream"
+    end
+  end
+
   private
 
   def handler_simple(request)

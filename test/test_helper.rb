@@ -31,7 +31,7 @@ class HyperRubyTest < Minitest::Test
     end
 
     client = HTTPX.with(origin: "http://127.0.0.1:3010")
-    block.call(client)
+    block.call(client, server)
 
   ensure
     server.stop if server

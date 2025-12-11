@@ -14,14 +14,15 @@ config = {
   bind_address: ENV.fetch("BIND_ADDRESS", "127.0.0.1:3000"),
   tokio_threads: ENV.fetch("TOKIO_THREADS", "1").to_i,
   debug: ENV.fetch("DEBUG", "false") == "true",
-  recv_timeout: ENV.fetch("RECV_TIMEOUT", "30000").to_i
+  recv_timeout: ENV.fetch("RECV_TIMEOUT", "30000").to_i,
+  max_connection_age: ENV.fetch("MAX_CONNECTION_AGE", "30000").to_i
 }
 server.configure(config)
 
 puts "Starting server with config: #{config}"
 
 accept_response = HyperRuby::Response.new(
-  200,
+  202,
   { "Content-Type" => "application/json" },
   { "message" => "Accepted" }.to_json
 )

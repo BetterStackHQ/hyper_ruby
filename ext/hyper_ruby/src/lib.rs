@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::{TcpListener, UnixListener};
 
@@ -80,6 +81,7 @@ struct ServerConfig {
     recv_timeout: u64,
     channel_capacity: usize,
     send_timeout: u64,
+    max_connection_age: Option<u64>,
 }
 
 impl ServerConfig {
@@ -91,6 +93,7 @@ impl ServerConfig {
             recv_timeout: 30000, // Default 30 second timeout
             channel_capacity: 5000, // Default capacity for worker channel
             send_timeout: 1000, // Default 1 second timeout for send backpressure
+            max_connection_age: None, // No limit by default
         }
     }
 }
@@ -109,6 +112,7 @@ struct Server {
     work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<RequestWithCompletion>>>>,
     runtime: RefCell<Option<Arc<tokio::runtime::Runtime>>>,
     shutdown: RefCell<Option<broadcast::Sender<()>>>,
+    total_connections: Arc<AtomicU64>,
 }
 
 impl Server {
@@ -121,7 +125,12 @@ impl Server {
             work_tx: RefCell::new(None),
             runtime: RefCell::new(None),
             shutdown: RefCell::new(None),
+            total_connections: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn total_connections(&self) -> u64 {
+        self.total_connections.load(Ordering::Relaxed)
     }
 
     pub fn configure(&self, config: magnus::RHash) -> Result<(), MagnusError> {
@@ -148,6 +157,10 @@ impl Server {
         
         if let Some(send_timeout) = config.get(magnus::Symbol::new("send_timeout")) {
             server_config.send_timeout = u64::try_convert(send_timeout)?;
+        }
+
+        if let Some(max_connection_age) = config.get(magnus::Symbol::new("max_connection_age")) {
+            server_config.max_connection_age = Some(u64::try_convert(max_connection_age)?);
         }
 
         // Initialize logging if not already initialized
@@ -263,7 +276,9 @@ impl Server {
         *self.work_tx.borrow_mut() = Some(work_tx.clone());
         
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        *self.shutdown.borrow_mut() = Some(shutdown_tx);
+        *self.shutdown.borrow_mut() = Some(shutdown_tx.clone());
+
+        let total_connections = self.total_connections.clone();
 
         let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
             
@@ -346,17 +361,19 @@ impl Server {
             };
 
             // Now that we have successfully bound, spawn the server task
+            let max_connection_age = config.max_connection_age;
             let server_task = tokio::spawn(async move {
                 let graceful_shutdown = GracefulShutdown::new();
                 let mut shutdown_rx = shutdown_rx;
 
                 loop {
                     tokio::select! {
-                        Ok((stream, _)) = listener.accept() => {                            
+                        Ok((stream, _)) = listener.accept() => {
+                            total_connections.fetch_add(1, Ordering::Relaxed);
                             info!("New connection established");
-                            
+
                             let io = TokioIo::new(stream);
-                            
+
                             debug!("Setting up connection");
 
                             let builder = builder.clone();
@@ -365,13 +382,50 @@ impl Server {
                                 debug!("Service handling request");
                                 handle_request(req, work_tx.clone(), config.recv_timeout, config.send_timeout)
                             }));
-                            let fut = graceful_shutdown.watch(conn.into_owned());
-                            tokio::task::spawn(async move {
-                                if let Err(err) = fut.await {
-                                    warn!("Error serving connection: {:?}", err);
-                                }
-                            });
-                        },                        
+                            // If max_connection_age is set, handle the connection with a timeout
+                            // but still integrate with server-wide graceful shutdown via broadcast channel
+                            if let Some(max_age_ms) = max_connection_age {
+                                let conn = conn.into_owned();
+                                let mut conn_shutdown_rx = shutdown_tx.subscribe();
+                                tokio::task::spawn(async move {
+                                    tokio::pin!(conn);
+                                    let sleep = tokio::time::sleep(std::time::Duration::from_millis(max_age_ms));
+                                    tokio::pin!(sleep);
+                                    let mut graceful_shutdown_started = false;
+
+                                    loop {
+                                        tokio::select! {
+                                            result = conn.as_mut() => {
+                                                if let Err(err) = result {
+                                                    warn!("Error serving connection: {:?}", err);
+                                                }
+                                                break;
+                                            }
+                                            _ = &mut sleep, if !graceful_shutdown_started => {
+                                                debug!("Connection reached max age ({}ms), sending GOAWAY", max_age_ms);
+                                                conn.as_mut().graceful_shutdown();
+                                                graceful_shutdown_started = true;
+                                                // Continue the loop to let the connection drain
+                                            }
+                                            _ = conn_shutdown_rx.recv(), if !graceful_shutdown_started => {
+                                                debug!("Server shutdown requested, sending GOAWAY to connection");
+                                                conn.as_mut().graceful_shutdown();
+                                                graceful_shutdown_started = true;
+                                                // Continue the loop to let the connection drain
+                                            }
+                                        }
+                                    }
+                                });
+                            } else {
+                                // No max age, use the graceful shutdown watcher
+                                let fut = graceful_shutdown.watch(conn.into_owned());
+                                tokio::task::spawn(async move {
+                                    if let Err(err) = fut.await {
+                                        warn!("Error serving connection: {:?}", err);
+                                    }
+                                });
+                            }
+                        },
                         _ = shutdown_rx.recv() => {
                             debug!("Graceful shutdown requested; shutting down");
                             break;
@@ -589,6 +643,7 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     server_class.define_method("start", method!(Server::start, 0))?;
     server_class.define_method("stop", method!(Server::stop, 0))?;
     server_class.define_method("run_worker", method!(Server::run_worker, 0))?;
+    server_class.define_method("total_connections", method!(Server::total_connections, 0))?;
 
     let response_class = module.define_class("Response", ruby.class_object())?;
     response_class.define_singleton_method("new", function!(Response::new, 3))?;

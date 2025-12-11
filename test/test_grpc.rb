@@ -144,12 +144,98 @@ class TestGrpc < HyperRubyTest
           'grpc.enable_http_proxy' => 0,
         }.merge(compression_channel_args)
       )
-      
+
       request = Echo::EchoRequest.new(message: "Hello Compressed GRPC " + ("a" * 10000))
       response = stub.echo(request)
-      
+
       assert_instance_of Echo::EchoResponse, response
       assert_equal "Decompressed: Hello Compressed GRPC " + ("a" * 10000), response.message
+    end
+  end
+
+  def test_max_connection_age_sends_goaway
+    # Test that max_connection_age causes the server to send GOAWAY after the configured time,
+    # forcing the client to establish a new connection
+    buffer = String.new(capacity: 1024)
+    server_config = {
+      bind_address: "127.0.0.1:3010",
+      tokio_threads: 1,
+      max_connection_age: 500  # 500ms max connection age
+    }
+
+    with_configured_server(server_config, -> (request) { handler_grpc(request, buffer) }) do |_client, server|
+      stub = Echo::Echo::Stub.new(
+        "127.0.0.1:3010",
+        :this_channel_is_insecure,
+        channel_args: {
+          'grpc.enable_http_proxy' => 0
+        }
+      )
+
+      # Record initial connection count
+      initial_connections = server.total_connections
+
+      # First request establishes a connection
+      request = Echo::EchoRequest.new(message: "Request 1")
+      response = stub.echo(request)
+      assert_equal "Request 1 response", response.message
+
+      # Should have one connection now
+      assert_equal initial_connections + 1, server.total_connections, "First request should establish one connection"
+
+      # Wait for max_connection_age to expire and GOAWAY to be sent
+      sleep 0.7
+
+      # Make another request - gRPC client should establish a new connection after GOAWAY
+      request = Echo::EchoRequest.new(message: "Request 2")
+      response = stub.echo(request)
+      assert_equal "Request 2 response", response.message
+
+      # Should have a second connection now (client reconnected after GOAWAY)
+      assert_equal initial_connections + 2, server.total_connections, "Second request after GOAWAY should establish a new connection"
+    end
+  end
+
+  def test_long_max_connection_age_reuses_connection
+    # Test that with a long max_connection_age, the connection is reused
+    # (opposite of test_max_connection_age_sends_goaway)
+    buffer = String.new(capacity: 1024)
+    server_config = {
+      bind_address: "127.0.0.1:3010",
+      tokio_threads: 1,
+      max_connection_age: 60000  # 60 seconds - much longer than test duration
+    }
+
+    with_configured_server(server_config, -> (request) { handler_grpc(request, buffer) }) do |_client, server|
+      stub = Echo::Echo::Stub.new(
+        "127.0.0.1:3010",
+        :this_channel_is_insecure,
+        channel_args: {
+          'grpc.enable_http_proxy' => 0
+        }
+      )
+
+      # Record initial connection count
+      initial_connections = server.total_connections
+
+      # First request establishes a connection
+      request = Echo::EchoRequest.new(message: "Request 1")
+      response = stub.echo(request)
+      assert_equal "Request 1 response", response.message
+
+      # Should have one connection now
+      assert_equal initial_connections + 1, server.total_connections, "First request should establish one connection"
+
+      # Wait a bit (but less than max_connection_age)
+      sleep 0.3
+
+      # Make another request - should reuse the same connection
+      request = Echo::EchoRequest.new(message: "Request 2")
+      response = stub.echo(request)
+      assert_equal "Request 2 response", response.message
+
+      # Should still have only one connection (connection reused, no GOAWAY sent)
+      assert_equal initial_connections + 1, server.total_connections, "Second request should reuse existing connection"
     end
   end
 

@@ -30,7 +30,7 @@ trait FillBuffer {
             let existing_capacity = rb_str_capacity(inner) as i64;
 
             if existing_capacity < body_len {
-                rb_str_modify_expand(inner, body_len);
+                rb_str_modify_expand(inner, body_len - existing_capacity);
             } else {
                 rb_str_modify(inner);
             }

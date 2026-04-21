@@ -27,7 +27,7 @@ use crossbeam_channel;
 
 use hyper::service::service_fn;
 use hyper::{Error, Request as HyperRequest, Response as HyperResponse, StatusCode};
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
 use http_body_util::BodyExt;
@@ -494,7 +494,17 @@ async fn handle_request(
     debug!("Headers: {:?}", req.headers());
 
     let (parts, body) = req.into_parts();
-    
+
+    // Capture the declared body length before consuming the body. Hyper's
+    // `Incoming::size_hint().exact()` mirrors the inbound Content-Length
+    // (populated from the header for H2 as well as H1), and is the only
+    // signal we have here: hyper converts `RST_STREAM(NO_ERROR|CANCEL)` —
+    // the codes browsers send on navigation cancellation — into a clean
+    // end-of-body rather than surfacing the reset (see
+    // hyper-1.6.0/src/body/incoming.rs:~249). We therefore validate the
+    // declared length against what we actually collected.
+    let declared_len = body.size_hint().exact();
+
     // Collect the body with timeout
     let body_bytes = match timeout(
         std::time::Duration::from_millis(recv_timeout),
@@ -510,8 +520,18 @@ async fn handle_request(
             return Ok(create_timeout_response());
         }
     };
-    
+
     debug!("Collected body size: {}", body_bytes.len());
+
+    if let Some(declared) = declared_len {
+        if declared != body_bytes.len() as u64 {
+            warn!(
+                "Body truncated: declared {} bytes, received {} — likely RST_STREAM(CANCEL); rejecting request",
+                declared, body_bytes.len()
+            );
+            return Ok(create_bad_request_response("Body length does not match Content-Length"));
+        }
+    }
 
     let hyper_request = HyperRequest::from_parts(parts, body_bytes);
     let is_grpc = grpc::is_grpc_request(&hyper_request);
@@ -628,8 +648,16 @@ fn create_too_many_requests_response(error_message: &str) -> HyperResponse<BodyW
     let builder = HyperResponse::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header("content-type", "text/plain");
-    
+
     builder.body(BodyWithTrailers::new(Bytes::from(error_message.to_string()), None))
+        .unwrap()
+}
+
+fn create_bad_request_response(error_message: &str) -> HyperResponse<BodyWithTrailers> {
+    HyperResponse::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "text/plain")
+        .body(BodyWithTrailers::new(Bytes::from(error_message.to_string()), None))
         .unwrap()
 }
 

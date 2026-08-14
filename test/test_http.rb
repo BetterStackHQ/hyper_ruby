@@ -153,6 +153,65 @@ class TestHttp < HyperRubyTest
     end
   end
 
+  def test_unix_socket_takeover_preserves_new_generation_socket
+    # A replacement server (e.g. a redeployed container) can bind the same path while the
+    # old server is still draining; the old server's stop must not delete the new socket.
+    socket_path = "/tmp/hyper_ruby_test_takeover.sock"
+    File.unlink(socket_path) if File.exist?(socket_path)
+
+    old_server = HyperRuby::Server.new
+    old_server.configure({ bind_address: "unix:#{socket_path}" })
+    old_server.start
+
+    new_server = HyperRuby::Server.new
+    new_server.configure({ bind_address: "unix:#{socket_path}" })
+    new_server.start
+
+    workers = 1.times.map do
+      Thread.new do
+        new_server.run_worker { |request| handler_simple(request) }
+      end
+    end
+
+    old_server.stop
+    old_server = nil
+    assert File.exist?(socket_path), "old server's stop must not remove the new server's socket"
+
+    client = HTTPX.with(transport: "unix", addresses: [socket_path], origin: "http://host")
+    response = client.get("/")
+    assert_equal 200, response.status
+
+    new_server.stop
+    workers.each(&:join)
+    workers = nil
+    refute File.exist?(socket_path), "new server's stop should remove the socket it owns"
+  ensure
+    old_server.stop if old_server
+    new_server.stop if new_server && workers
+    workers&.each(&:join)
+    File.unlink(socket_path) if File.exist?(socket_path)
+  end
+
+  def test_unix_socket_stop_leaves_foreign_file
+    # If something else has replaced our socket file, stop must leave it alone.
+    socket_path = "/tmp/hyper_ruby_test_foreign.sock"
+    File.unlink(socket_path) if File.exist?(socket_path)
+
+    server = HyperRuby::Server.new
+    server.configure({ bind_address: "unix:#{socket_path}" })
+    server.start
+
+    File.unlink(socket_path)
+    FileUtils.touch(socket_path)
+
+    server.stop
+    server = nil
+    assert File.exist?(socket_path), "stop must not remove a file it did not bind"
+  ensure
+    server.stop if server
+    File.unlink(socket_path) if File.exist?(socket_path)
+  end
+
   # This test requires root permissions to create a file that can't be deleted.
   # Skip it unless we're running with proper permissions.
   def test_unix_socket_undeletable
@@ -171,13 +230,13 @@ class TestHttp < HyperRubyTest
       server = HyperRuby::Server.new
       server.configure({ bind_address: "unix:#{socket_path}" })
       
-      # This should raise an exception about not being able to remove the file
+      # This should raise an exception about not being able to install the socket file
       error = assert_raises(RuntimeError) do
         server.start
       end
-      
+
       # Verify the error message
-      assert_match(/Failed to remove existing Unix socket file/, error.message)
+      assert_match(/Failed to install Unix socket file/, error.message)
     ensure
       # Clean up with sudo
       system("sudo rm -f #{socket_path}") if File.exist?(socket_path)
@@ -201,14 +260,15 @@ class TestHttp < HyperRubyTest
         server.start
       end
       
-      # The error is from trying to remove the directory, not from binding
-      assert_match(/Failed to remove existing Unix socket file/, error.message)
-      
-      # It should include something about "Operation not permitted" or similar
-      assert(error.message.include?("Operation not permitted") || 
-             error.message.include?("Permission denied") || 
-             error.message.include?("not a socket"), 
-             "Error should indicate issue with removing directory: #{error.message}")
+      # The error is from renaming the bound socket over the directory, not from binding
+      assert_match(/Failed to install Unix socket file/, error.message)
+
+      # It should include something about the target being a directory or similar
+      assert(error.message.include?("Is a directory") ||
+             error.message.include?("Operation not permitted") ||
+             error.message.include?("Permission denied") ||
+             error.message.include?("not a socket"),
+             "Error should indicate issue with replacing directory: #{error.message}")
     ensure
       # Clean up
       FileUtils.rm_rf(socket_dir) if Dir.exist?(socket_dir)

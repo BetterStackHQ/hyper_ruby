@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::{TcpListener, UnixListener};
@@ -113,6 +114,9 @@ struct Server {
     runtime: RefCell<Option<Arc<tokio::runtime::Runtime>>>,
     shutdown: RefCell<Option<broadcast::Sender<()>>>,
     total_connections: Arc<AtomicU64>,
+    // (dev, ino) of the Unix socket file this server bound, so stop() only removes
+    // the file if a replacement server hasn't taken over the path in the meantime.
+    socket_ident: RefCell<Option<(u64, u64)>>,
 }
 
 impl Server {
@@ -126,6 +130,7 @@ impl Server {
             runtime: RefCell::new(None),
             shutdown: RefCell::new(None),
             total_connections: Arc::new(AtomicU64::new(0)),
+            socket_ident: RefCell::new(None),
         }
     }
 
@@ -310,32 +315,40 @@ impl Server {
             // Create the listener with proper error handling
             let listener = if config.bind_address.starts_with("unix:") {
                 let path = config.bind_address.trim_start_matches("unix:");
-                
-                // Check if the socket file already exists and try to delete it
-                if std::path::Path::new(path).exists() {
-                    debug!("Unix socket file {} already exists, attempting to remove it", path);
-                    match std::fs::remove_file(path) {
-                        Ok(_) => debug!("Successfully removed existing socket file"),
-                        Err(e) => {
-                            error!("Failed to remove existing Unix socket file {}: {}", path, e);
-                            return Err(MagnusError::new(
-                                magnus::exception::runtime_error(),
-                                format!("Failed to remove existing Unix socket file {}: {}", path, e)
-                            ));
-                        }
-                    }
-                }
-                
-                match UnixListener::bind(path) {
-                    Ok(listener) => Listener::Unix(listener),
+
+                // Bind to a unique temp path and atomically rename over the target, so the
+                // path always points at a live socket even when a replacement server takes
+                // over a path an older, still-draining server bound.
+                static SOCKET_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+                let tmp_path = format!("{}.{}.{}.tmp", path, std::process::id(), SOCKET_TMP_SEQ.fetch_add(1, Ordering::Relaxed));
+
+                let listener = match UnixListener::bind(&tmp_path) {
+                    Ok(listener) => listener,
                     Err(e) => {
-                        error!("Failed to bind to Unix socket {}: {}", path, e);
+                        error!("Failed to bind to Unix socket {}: {}", tmp_path, e);
                         return Err(MagnusError::new(
                             magnus::exception::runtime_error(),
-                            format!("Failed to bind to Unix socket {}: {}", path, e)
+                            format!("Failed to bind to Unix socket {}: {}", tmp_path, e)
                         ));
                     }
+                };
+
+                // The socket file's identity survives the rename; stop() compares against it
+                // so an older server generation never unlinks a newer generation's socket.
+                let ident = std::fs::symlink_metadata(&tmp_path).ok().map(|m| (m.dev(), m.ino()));
+
+                if let Err(e) = std::fs::rename(&tmp_path, path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    error!("Failed to install Unix socket file {}: {}", path, e);
+                    return Err(MagnusError::new(
+                        magnus::exception::runtime_error(),
+                        format!("Failed to install Unix socket file {}: {}", path, e)
+                    ));
                 }
+
+                *self.socket_ident.borrow_mut() = ident;
+
+                Listener::Unix(listener)
             } else {
                 match config.bind_address.parse::<SocketAddr>() {
                     Ok(addr) => {
@@ -474,9 +487,18 @@ impl Server {
         let bind_address = self.config.borrow().bind_address.clone();
         if bind_address.starts_with("unix:") {
             let path = bind_address.trim_start_matches("unix:");
-            std::fs::remove_file(path).unwrap_or_else(|e| {
-                warn!("Failed to remove socket file: {:?}", e);
-            });
+            // Only remove the socket file if it's still the one this server bound; a
+            // replacement server may have taken over the path while we were draining.
+            match (self.socket_ident.borrow_mut().take(), std::fs::symlink_metadata(path)) {
+                (Some((dev, ino)), Ok(meta)) if (meta.dev(), meta.ino()) == (dev, ino) => {
+                    std::fs::remove_file(path).unwrap_or_else(|e| {
+                        warn!("Failed to remove socket file: {:?}", e);
+                    });
+                }
+                (Some(_), Ok(_)) => info!("Socket file {} was replaced by another server; leaving it in place", path),
+                (Some(_), Err(_)) => debug!("Socket file {} already removed", path),
+                (None, _) => {}
+            }
         }
 
         Ok(())

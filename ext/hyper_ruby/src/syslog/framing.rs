@@ -1,6 +1,13 @@
 // RFC 6587 framing: octet counting (`<len> <message>`) with a non-transparent
 // newline fallback. A buffer whose first byte is a non-zero digit is treated as
 // octet counted, everything else is newline delimited.
+//
+// This file (including its test data) is a port of Vector 0.48.0's
+// lib/codecs/src/decoding/framing/octet_counting.rs and is licensed under the
+// Mozilla Public License 2.0, not the MIT licence covering the rest of this
+// gem. See https://github.com/vectordotdev/vector and
+// https://www.mozilla.org/en-US/MPL/2.0/. Deliberate divergences from that
+// source are marked below.
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, LinesCodec, LinesCodecError};
@@ -88,9 +95,17 @@ impl Framer {
 
     /// `None` if this buffer is not octet counting encoded.
     fn checked_decode(&mut self, src: &mut BytesMut) -> Option<Result<Option<Bytes>, FrameError>> {
-        if let Some(&first_byte) = src.first() {
-            if (b'1'..=b'9').contains(&first_byte) {
-                self.octet_decoding = Some(State::NotDiscarding);
+        // Divergence from the ported source: only a decoder with no state in
+        // hand starts a new octet counted frame. The source re-enters
+        // `NotDiscarding` whenever the buffer happens to start with a digit,
+        // so a read boundary that lands on a digit inside an oversize body
+        // loses the countdown and hands the rest of that body over as
+        // messages.
+        if self.octet_decoding.is_none() {
+            if let Some(&first_byte) = src.first() {
+                if (b'1'..=b'9').contains(&first_byte) {
+                    self.octet_decoding = Some(State::NotDiscarding);
+                }
             }
         }
 
@@ -118,7 +133,11 @@ impl Framer {
 
             (State::Discarding(chars), _, _) => {
                 // Not enough bytes yet; discard what we have and carry the
-                // remainder forward.
+                // remainder forward. Divergence from the ported source, which
+                // subtracts these the other way around: with overflow checks
+                // off, as in its release builds, the count wraps to a huge
+                // number and the frame is never reported, so this countdown is
+                // stricter than that source's behaviour.
                 self.octet_decoding = Some(State::Discarding(chars - src.len()));
                 src.advance(src.len());
                 Ok(None)
@@ -367,6 +386,25 @@ mod tests {
             decoder.decode(&mut buffer)
         );
         assert_eq!(b"32 something valid"[..], buffer);
+    }
+
+    #[test]
+    fn oversize_body_starting_with_a_digit_is_not_decoded_as_a_frame() {
+        let mut decoder = Framer::new(16);
+        let mut buffer = BytesMut::from(&b"26 "[..]);
+        assert_eq!(Ok(None), decoder.decode(&mut buffer));
+
+        // A read boundary leaving a digit at the front of the discarded body.
+        buffer.put(&b"9 abcdefghZ"[..]);
+        assert_eq!(Ok(None), decoder.decode(&mut buffer));
+        assert_eq!(b""[..], buffer);
+
+        buffer.put(&b"aaaaaaaaaaaaaaa5 next"[..]);
+        assert_eq!(
+            Err(FrameError::fatal(RejectReason::Oversize)),
+            decoder.decode(&mut buffer)
+        );
+        assert_eq!(b"5 next"[..], buffer);
     }
 
     #[test]

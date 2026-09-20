@@ -107,7 +107,9 @@ pub(crate) fn parse(buf: &[u8], max_length: usize) -> Result<ProxyHeader, ProxyE
                 octets.copy_from_slice(&buf[16..32]);
                 Some(IpAddr::V6(Ipv6Addr::from(octets)))
             }
-            0x00 => None,
+            // Unspecified and Unix families name no network peer; the
+            // transport's own peer stands.
+            0x00 | 0x31 | 0x32 => None,
             _ => return Err(ProxyError::Family),
         }
     };
@@ -182,6 +184,22 @@ mod tests {
     }
 
     #[test]
+    fn unix_and_unspecified_families_have_no_source() {
+        for family in [0x00, 0x31, 0x32] {
+            let header = v2_header(family, 0x1, &[0u8; 216]);
+            assert_eq!(
+                Ok(ProxyHeader::Complete {
+                    source: None,
+                    length: header.len(),
+                }),
+                parse(&header, 1024),
+                "family {:#x}",
+                family
+            );
+        }
+    }
+
+    #[test]
     fn local_command_has_no_source() {
         let header = v2_header(0x00, 0x0, &[]);
         assert_eq!(
@@ -217,7 +235,7 @@ mod tests {
         header[12] = 0x27;
         assert_eq!(Err(ProxyError::Command), parse(&header, 1024));
 
-        let header = v2_header(0x31, 0x1, &ipv4_address([192, 0, 2, 7]));
+        let header = v2_header(0x41, 0x1, &ipv4_address([192, 0, 2, 7]));
         assert_eq!(Err(ProxyError::Family), parse(&header, 1024));
 
         let header = v2_header(0x11, 0x1, &[0u8; 4]);

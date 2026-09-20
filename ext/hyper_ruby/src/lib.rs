@@ -162,8 +162,8 @@ impl Server {
         self.total_connections.load(Ordering::Relaxed)
     }
 
-    pub fn configure(&self, config: magnus::RHash) -> Result<(), MagnusError> {
-        let mut server_config = self.config.borrow_mut();
+    pub fn configure(rb_self: Obj<Self>, config: magnus::RHash) -> Result<(), MagnusError> {
+        let mut server_config = rb_self.config.borrow_mut();
         if let Some(bind_address) = config.get(magnus::Symbol::new("bind_address")) {
             server_config.bind_address = String::try_convert(bind_address)?;
         }
@@ -196,9 +196,9 @@ impl Server {
 
         if let Some(handler) = config.get(magnus::Symbol::new("syslog_handler")) {
             // Worker threads hold no other reference to the handler, so keep it
-            // marked for the life of the process.
-            magnus::gc::register_mark_object(handler);
-            *self.syslog_handler.borrow_mut() = Some(Opaque::from(handler));
+            // reachable through the server object they are running for.
+            rb_self.ivar_set("@syslog_handler", handler)?;
+            *rb_self.syslog_handler.borrow_mut() = Some(Opaque::from(handler));
         }
 
         // Initialize logging if not already initialized
@@ -237,12 +237,15 @@ impl Server {
         })?.clone();
 
         let syslog_handler = self.syslog_handler.borrow().map(|handler| ruby.get_inner(handler));
-        let syslog_enabled = self.config.borrow().syslog.enabled();
-        let mut prefer_syslog = false;
+        let (syslog_enabled, work_ratio) = {
+            let config = self.config.borrow();
+            (config.syslog.enabled(), config.syslog.work_ratio)
+        };
+        let mut syslog_streak = 0;
 
         loop {
             let next = if syslog_enabled {
-                next_work_item(&work_rx, &syslog_rx, &mut prefer_syslog)
+                next_work_item(&work_rx, &syslog_rx, &mut syslog_streak, work_ratio)
             } else {
                 next_http_work_item(&work_rx)
             };
@@ -303,8 +306,8 @@ impl Server {
                     }
                 }
                 WorkItem::Syslog(delivery) => {
-                    let accepted = call_syslog_handler(syslog_handler, &delivery);
-                    if delivery.result_tx.send(accepted).is_err() {
+                    let result = call_syslog_handler(syslog_handler, &delivery);
+                    if delivery.result_tx.send(result).is_err() {
                         debug!("Syslog listener stopped waiting for an admission result");
                     }
                 }
@@ -354,7 +357,6 @@ impl Server {
 
         let syslog_config = config.syslog.clone();
         let syslog_counters = self.syslog_counters.clone();
-        let syslog_shutdown_tx = shutdown_tx.clone();
 
         rt.block_on(async move {
             // Instead of spawning a task, we'll run the server setup inline first to catch binding errors
@@ -513,10 +515,9 @@ impl Server {
             });
 
             if syslog_config.enabled() {
-                match syslog::start(&syslog_config, syslog_counters, syslog_work_tx, &syslog_shutdown_tx) {
+                match syslog::start(&syslog_config, syslog_counters, syslog_work_tx) {
                     Ok(syslog_runtime) => *self.syslog_runtime.borrow_mut() = Some(syslog_runtime),
                     Err(e) => {
-                        let _ = syslog_shutdown_tx.send(());
                         error!("Failed to start syslog listeners: {}", e);
                         return Err(MagnusError::new(
                             magnus::exception::runtime_error(),
@@ -545,9 +546,18 @@ impl Server {
     }
 
     pub fn stop(&self) -> Result<(), MagnusError> {
-        if let Some(rt) = self.runtime.borrow().as_ref() {
+        // Take owned handles first: no RefCell borrow may be held while the GVL
+        // is released, or a concurrent Ruby call panics on borrow_mut.
+        let runtime = self.runtime.borrow().clone();
+        let syslog_runtime = self.syslog_runtime.borrow_mut().take();
+
+        if let Some(rt) = runtime.as_ref() {
             if let Some(shutdown) = self.shutdown.borrow().as_ref() {
                 let _ = shutdown.send(());
+            }
+
+            if let Some(syslog_runtime) = syslog_runtime.as_ref() {
+                syslog_runtime.stop_accepting();
             }
 
             rt.block_on(async {
@@ -557,14 +567,14 @@ impl Server {
                 }
             });
 
-            if let Some(syslog_runtime) = self.syslog_runtime.borrow().as_ref() {
+            if let Some(syslog_runtime) = syslog_runtime.as_ref() {
                 // Release the GVL so worker threads can accept the messages the
                 // listeners have already framed.
                 nogvl(|| rt.block_on(syslog_runtime.drain(SYSLOG_DRAIN_TIMEOUT)));
             }
         }
 
-        if let Some(syslog_runtime) = self.syslog_runtime.borrow_mut().take() {
+        if let Some(syslog_runtime) = syslog_runtime.as_ref() {
             syslog_runtime.remove_socket_file();
         }
 
@@ -610,42 +620,57 @@ fn next_http_work_item(
 }
 
 // Take the next piece of work for a Ruby worker, taking whatever is already
-// queued so we only release the GVL when both channels are empty. The channels
-// alternate which one is asked first, and the blocking select picks uniformly
-// between them, so neither transport starves the other.
+// queued so we only release the GVL when both channels are empty. Syslog
+// messages go first until work_ratio of them have run ahead of a waiting
+// request, then a request goes and the count starts again; the blocking select
+// picks uniformly between the two.
 fn next_work_item(
     work_rx: &crossbeam_channel::Receiver<RequestWithCompletion>,
     syslog_rx: &crossbeam_channel::Receiver<syslog::SyslogDelivery>,
-    prefer_syslog: &mut bool,
+    syslog_streak: &mut u32,
+    work_ratio: u32,
 ) -> Option<WorkItem> {
-    let syslog_first = *prefer_syslog;
-    *prefer_syslog = !syslog_first;
+    let syslog_first = *syslog_streak < work_ratio;
 
     if syslog_first {
         match try_syslog_work_item(syslog_rx) {
             TryWork::Empty => (),
-            outcome => return outcome.into_work_item(),
+            outcome => return count_work_item(outcome, syslog_streak),
         }
     }
 
     match try_http_work_item(work_rx) {
         TryWork::Empty => (),
-        outcome => return outcome.into_work_item(),
+        outcome => return count_work_item(outcome, syslog_streak),
     }
 
     if !syslog_first {
         match try_syslog_work_item(syslog_rx) {
             TryWork::Empty => (),
-            outcome => return outcome.into_work_item(),
+            outcome => return count_work_item(outcome, syslog_streak),
         }
     }
 
-    nogvl(|| {
+    let selected = nogvl(|| {
         crossbeam_channel::select! {
             recv(work_rx) -> request => request.ok().map(WorkItem::Http),
             recv(syslog_rx) -> delivery => delivery.ok().map(WorkItem::Syslog),
         }
-    })
+    });
+
+    match selected {
+        Some(work_item) => count_work_item(TryWork::Found(work_item), syslog_streak),
+        None => None,
+    }
+}
+
+fn count_work_item(outcome: TryWork, syslog_streak: &mut u32) -> Option<WorkItem> {
+    match &outcome {
+        TryWork::Found(WorkItem::Syslog(_)) => *syslog_streak += 1,
+        TryWork::Found(WorkItem::Http(_)) => *syslog_streak = 0,
+        _ => (),
+    }
+    outcome.into_work_item()
 }
 
 enum TryWork {
@@ -682,10 +707,13 @@ fn try_syslog_work_item(syslog_rx: &crossbeam_channel::Receiver<syslog::SyslogDe
 
 // Hand one syslog message to the configured handler; anything other than a
 // truthy result means the message was not admitted.
-fn call_syslog_handler(handler: Option<Value>, delivery: &syslog::SyslogDelivery) -> bool {
+fn call_syslog_handler(
+    handler: Option<Value>,
+    delivery: &syslog::SyslogDelivery,
+) -> syslog::HandlerResult {
     let Some(handler) = handler else {
         error!("Syslog message received but no syslog_handler is configured - refusing");
-        return false;
+        return syslog::HandlerResult::Refused;
     };
 
     // Stream frames are validated during framing; datagrams stay binary.
@@ -694,18 +722,26 @@ fn call_syslog_handler(handler: Option<Value>, delivery: &syslog::SyslogDelivery
         _ => RString::from_slice(&delivery.message),
     };
 
+    let peer = match &delivery.peer {
+        Some(peer) => RString::new(peer).as_value(),
+        None => magnus::value::qnil().as_value(),
+    };
+
     let args = (
         message,
-        RString::new(&delivery.peer),
+        peer,
         delivery.transport.symbol(),
         delivery.received_at_ns,
+        delivery.message_id,
+        delivery.attempt,
     );
 
     match handler.funcall::<_, _, Value>("call", args) {
-        Ok(result) => result.to_bool(),
+        Ok(result) if result.to_bool() => syslog::HandlerResult::Accepted,
+        Ok(_) => syslog::HandlerResult::Refused,
         Err(e) => {
             error!("Syslog handler raised {:?} - treating the message as refused", e);
-            false
+            syslog::HandlerResult::Failed
         }
     }
 }

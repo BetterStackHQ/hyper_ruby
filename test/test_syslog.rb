@@ -360,6 +360,42 @@ class TestSyslog < HyperRubyTest
     end
   end
 
+  def test_syslog_delivery_progresses_under_http_load
+    # A handler slow enough that the request queue never empties, which is what
+    # would let requests starve syslog messages.
+    slow_request = lambda do |_request|
+      sleep 0.005
+      HyperRuby::Response.new(200, {}, "")
+    end
+
+    with_syslog_server(syslog_config(stream: true), @collector.handler, request_handler: slow_request) do |server|
+      flooding = true
+      floods = 8.times.map do
+        Thread.new do
+          Net::HTTP.start("127.0.0.1", @http_port) do |http|
+            http.request(Net::HTTP::Get.new("/")) while flooding
+          end
+        rescue IOError, EOFError, SystemCallError
+          nil
+        end
+      end
+
+      begin
+        connect_stream(server) do |socket|
+          50.times { |i| socket.write("<13>under load #{i}\n") }
+          socket.flush
+          wait_until(timeout: 10) { @collector.count == 50 }
+        end
+
+        assert_equal 50, @collector.count
+        assert_equal 50, server.syslog_stats[:messages_delivered]
+      ensure
+        flooding = false
+        floods.each(&:join)
+      end
+    end
+  end
+
   private
 
   @@next_port = 3400

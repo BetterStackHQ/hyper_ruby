@@ -237,9 +237,17 @@ impl Server {
         })?.clone();
 
         let syslog_handler = self.syslog_handler.borrow().map(|handler| ruby.get_inner(handler));
+        let syslog_enabled = self.config.borrow().syslog.enabled();
+        let mut prefer_syslog = false;
 
         loop {
-            let work_item = match next_work_item(&work_rx, &syslog_rx) {
+            let next = if syslog_enabled {
+                next_work_item(&work_rx, &syslog_rx, &mut prefer_syslog)
+            } else {
+                next_http_work_item(&work_rx)
+            };
+
+            let work_item = match next {
                 Some(work_item) => work_item,
                 None => break,
             };
@@ -587,24 +595,49 @@ impl Server {
     }
 }
 
-// Take the next piece of work for a Ruby worker, preferring whatever is already
-// queued so we only release the GVL when both channels are empty. The fast path
-// checks requests first; syslog messages wait behind them, and their own
-// backpressure holds them rather than dropping them.
+// Take the next request for a Ruby worker when no syslog listener is running.
+fn next_http_work_item(
+    work_rx: &crossbeam_channel::Receiver<RequestWithCompletion>,
+) -> Option<WorkItem> {
+    // try getting the next request without yielding the GVL, if there's nothing, wait for one
+    match work_rx.try_recv() {
+        Ok(request) => Some(WorkItem::Http(request)),
+        Err(crossbeam_channel::TryRecvError::Empty) => {
+            nogvl(|| work_rx.recv()).ok().map(WorkItem::Http)
+        },
+        Err(crossbeam_channel::TryRecvError::Disconnected) => None,
+    }
+}
+
+// Take the next piece of work for a Ruby worker, taking whatever is already
+// queued so we only release the GVL when both channels are empty. The channels
+// alternate which one is asked first, and the blocking select picks uniformly
+// between them, so neither transport starves the other.
 fn next_work_item(
     work_rx: &crossbeam_channel::Receiver<RequestWithCompletion>,
     syslog_rx: &crossbeam_channel::Receiver<syslog::SyslogDelivery>,
+    prefer_syslog: &mut bool,
 ) -> Option<WorkItem> {
-    match work_rx.try_recv() {
-        Ok(request) => return Some(WorkItem::Http(request)),
-        Err(crossbeam_channel::TryRecvError::Disconnected) => return None,
-        Err(crossbeam_channel::TryRecvError::Empty) => (),
+    let syslog_first = *prefer_syslog;
+    *prefer_syslog = !syslog_first;
+
+    if syslog_first {
+        match try_syslog_work_item(syslog_rx) {
+            TryWork::Empty => (),
+            outcome => return outcome.into_work_item(),
+        }
     }
 
-    match syslog_rx.try_recv() {
-        Ok(delivery) => return Some(WorkItem::Syslog(delivery)),
-        Err(crossbeam_channel::TryRecvError::Disconnected) => return None,
-        Err(crossbeam_channel::TryRecvError::Empty) => (),
+    match try_http_work_item(work_rx) {
+        TryWork::Empty => (),
+        outcome => return outcome.into_work_item(),
+    }
+
+    if !syslog_first {
+        match try_syslog_work_item(syslog_rx) {
+            TryWork::Empty => (),
+            outcome => return outcome.into_work_item(),
+        }
     }
 
     nogvl(|| {
@@ -613,6 +646,38 @@ fn next_work_item(
             recv(syslog_rx) -> delivery => delivery.ok().map(WorkItem::Syslog),
         }
     })
+}
+
+enum TryWork {
+    Found(WorkItem),
+    Empty,
+    Closed,
+}
+
+impl TryWork {
+    fn into_work_item(self) -> Option<WorkItem> {
+        match self {
+            TryWork::Found(work_item) => Some(work_item),
+            // A closed channel stops the worker, as it always has.
+            TryWork::Empty | TryWork::Closed => None,
+        }
+    }
+}
+
+fn try_http_work_item(work_rx: &crossbeam_channel::Receiver<RequestWithCompletion>) -> TryWork {
+    match work_rx.try_recv() {
+        Ok(request) => TryWork::Found(WorkItem::Http(request)),
+        Err(crossbeam_channel::TryRecvError::Empty) => TryWork::Empty,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => TryWork::Closed,
+    }
+}
+
+fn try_syslog_work_item(syslog_rx: &crossbeam_channel::Receiver<syslog::SyslogDelivery>) -> TryWork {
+    match syslog_rx.try_recv() {
+        Ok(delivery) => TryWork::Found(WorkItem::Syslog(delivery)),
+        Err(crossbeam_channel::TryRecvError::Empty) => TryWork::Empty,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => TryWork::Closed,
+    }
 }
 
 // Hand one syslog message to the configured handler; anything other than a

@@ -38,6 +38,28 @@ class HyperRubyTest < Minitest::Test
     workers.map(&:join) if workers
   end
 
+  # Starts a server with syslog listeners configured; the syslog handler is
+  # called with (message, peer_ip, transport, received_at_ns) on a worker thread.
+  def with_syslog_server(config, syslog_handler, worker_count: 1, &block)
+    server = HyperRuby::Server.new
+    server.configure(config.merge(syslog_handler: syslog_handler))
+    server.start
+
+    workers = worker_count.times.map do
+      Thread.new do
+        server.run_worker do |_request|
+          HyperRuby::Response.new(200, {}, "")
+        end
+      end
+    end
+
+    block.call(server)
+
+  ensure
+    server.stop if server
+    workers.map(&:join) if workers
+  end
+
   def with_unix_socket_server(request_handler, &block)
     server = HyperRuby::Server.new
     server.configure({ 

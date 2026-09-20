@@ -2,6 +2,7 @@ mod request;
 mod response;
 mod gvl_helpers;
 mod grpc;
+mod syslog;
 
 use hyper_util::server::graceful::GracefulShutdown;
 use request::{Request, GrpcRequest};
@@ -10,7 +11,7 @@ use gvl_helpers::nogvl;
 
 use magnus::block::block_proc;
 use magnus::typed_data::Obj;
-use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, Ruby, Value, RString};
+use magnus::{function, method, prelude::*, value::Opaque, Error as MagnusError, IntoValue, RHash, Ruby, Value, RString};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -48,6 +49,10 @@ use tokio::sync::broadcast;
 
 static LOGGER_INIT: Once = Once::new();
 
+// How long stop() waits for the syslog listeners to finish delivering messages
+// they have already framed.
+const SYSLOG_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -83,6 +88,7 @@ struct ServerConfig {
     channel_capacity: usize,
     send_timeout: u64,
     max_connection_age: Option<u64>,
+    syslog: syslog::SyslogConfig,
 }
 
 impl ServerConfig {
@@ -95,6 +101,7 @@ impl ServerConfig {
             channel_capacity: 5000, // Default capacity for worker channel
             send_timeout: 1000, // Default 1 second timeout for send backpressure
             max_connection_age: None, // No limit by default
+            syslog: syslog::SyslogConfig::new(),
         }
     }
 }
@@ -103,6 +110,13 @@ impl ServerConfig {
 struct RequestWithCompletion {
     request: HyperRequest<Bytes>,
     response_tx: oneshot::Sender<HyperResponse<BodyWithTrailers>>,
+}
+
+// A unit of work for a Ruby worker thread; HTTP requests and syslog messages
+// have their own channels but share the worker threads.
+enum WorkItem {
+    Http(RequestWithCompletion),
+    Syslog(syslog::SyslogDelivery),
 }
 
 #[magnus::wrap(class = "HyperRuby::Server")]
@@ -117,6 +131,11 @@ struct Server {
     // (dev, ino) of the Unix socket file this server bound, so stop() only removes
     // the file if a replacement server hasn't taken over the path in the meantime.
     socket_ident: RefCell<Option<(u64, u64)>>,
+    syslog_work_rx: RefCell<Option<crossbeam_channel::Receiver<syslog::SyslogDelivery>>>,
+    syslog_work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<syslog::SyslogDelivery>>>>,
+    syslog_handler: RefCell<Option<Opaque<Value>>>,
+    syslog_counters: Arc<syslog::SyslogCounters>,
+    syslog_runtime: RefCell<Option<syslog::SyslogRuntime>>,
 }
 
 impl Server {
@@ -131,6 +150,11 @@ impl Server {
             shutdown: RefCell::new(None),
             total_connections: Arc::new(AtomicU64::new(0)),
             socket_ident: RefCell::new(None),
+            syslog_work_rx: RefCell::new(None),
+            syslog_work_tx: RefCell::new(None),
+            syslog_handler: RefCell::new(None),
+            syslog_counters: Arc::new(syslog::SyslogCounters::default()),
+            syslog_runtime: RefCell::new(None),
         }
     }
 
@@ -168,6 +192,15 @@ impl Server {
             server_config.max_connection_age = Some(u64::try_convert(max_connection_age)?);
         }
 
+        server_config.syslog.apply(&config)?;
+
+        if let Some(handler) = config.get(magnus::Symbol::new("syslog_handler")) {
+            // Worker threads hold no other reference to the handler, so keep it
+            // marked for the life of the process.
+            magnus::gc::register_mark_object(handler);
+            *self.syslog_handler.borrow_mut() = Some(Opaque::from(handler));
+        }
+
         // Initialize logging if not already initialized
         LOGGER_INIT.call_once(|| {
             let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
@@ -190,26 +223,29 @@ impl Server {
     // Method that Ruby worker threads will call with a block
     pub fn run_worker(&self) -> Result<(), MagnusError> {
         let block = block_proc().unwrap();
-        
+        let ruby = Ruby::get().map_err(|e| {
+            MagnusError::new(magnus::exception::runtime_error(), format!("Workers must run on a Ruby thread: {:?}", e))
+        })?;
+
         // Check if we have a work_rx channel, error out if not
         let work_rx = self.work_rx.borrow().as_ref().ok_or_else(|| {
             MagnusError::new(magnus::exception::runtime_error(), "Server must be started before running workers")
         })?.clone();
-       
+
+        let syslog_rx = self.syslog_work_rx.borrow().as_ref().ok_or_else(|| {
+            MagnusError::new(magnus::exception::runtime_error(), "Server must be started before running workers")
+        })?.clone();
+
+        let syslog_handler = self.syslog_handler.borrow().map(|handler| ruby.get_inner(handler));
+
         loop {
-            // try getting the next request without yielding the GVL, if there's nothing, wait for one
-            let work_request = match work_rx.try_recv() {
-                Ok(work_request) => Ok(work_request),
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    nogvl(|| work_rx.recv())
-                },
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    break;
-                }
+            let work_item = match next_work_item(&work_rx, &syslog_rx) {
+                Some(work_item) => work_item,
+                None => break,
             };
 
-            match work_request {
-                Ok(work_request) => {
+            match work_item {
+                WorkItem::Http(work_request) => {
                     let hyper_request = work_request.request;
                     
                     debug!("Processing request:");
@@ -258,13 +294,15 @@ impl Server {
                         Err(e) => error!("Failed to send response back to client: {:?} - response dropped", e),
                     }
                 }
-                Err(_) => {
-                    // Channel closed, exit thread
-                    break;
+                WorkItem::Syslog(delivery) => {
+                    let accepted = call_syslog_handler(syslog_handler, &delivery);
+                    if delivery.result_tx.send(accepted).is_err() {
+                        debug!("Syslog listener stopped waiting for an admission result");
+                    }
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -279,7 +317,13 @@ impl Server {
         *self.work_rx.borrow_mut() = Some(work_rx);
         let work_tx = Arc::new(work_tx);
         *self.work_tx.borrow_mut() = Some(work_tx.clone());
-        
+
+        // Syslog messages queue separately but are drained by the same workers.
+        let (syslog_work_tx, syslog_work_rx) = crossbeam_channel::bounded(config.channel_capacity);
+        *self.syslog_work_rx.borrow_mut() = Some(syslog_work_rx);
+        let syslog_work_tx = Arc::new(syslog_work_tx);
+        *self.syslog_work_tx.borrow_mut() = Some(syslog_work_tx.clone());
+
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         *self.shutdown.borrow_mut() = Some(shutdown_tx.clone());
 
@@ -299,6 +343,10 @@ impl Server {
 
         *self.runtime.borrow_mut() = Some(rt.clone());
 
+
+        let syslog_config = config.syslog.clone();
+        let syslog_counters = self.syslog_counters.clone();
+        let syslog_shutdown_tx = shutdown_tx.clone();
 
         rt.block_on(async move {
             // Instead of spawning a task, we'll run the server setup inline first to catch binding errors
@@ -456,6 +504,20 @@ impl Server {
                 }
             });
 
+            if syslog_config.enabled() {
+                match syslog::start(&syslog_config, syslog_counters, syslog_work_tx, &syslog_shutdown_tx) {
+                    Ok(syslog_runtime) => *self.syslog_runtime.borrow_mut() = Some(syslog_runtime),
+                    Err(e) => {
+                        let _ = syslog_shutdown_tx.send(());
+                        error!("Failed to start syslog listeners: {}", e);
+                        return Err(MagnusError::new(
+                            magnus::exception::runtime_error(),
+                            format!("Failed to start syslog listeners: {}", e)
+                        ));
+                    }
+                }
+            }
+
             let mut handle = self.server_handle.lock().await;
             *handle = Some(server_task);
 
@@ -463,6 +525,15 @@ impl Server {
         })?;
             
         Ok(())
+    }
+
+    // True while the configured syslog listeners are bound and accepting.
+    pub fn syslog_listening(&self) -> bool {
+        self.syslog_runtime.borrow().as_ref().map(|runtime| runtime.listening()).unwrap_or(false)
+    }
+
+    pub fn syslog_stats(&self) -> Result<RHash, MagnusError> {
+        self.syslog_counters.to_hash()
     }
 
     pub fn stop(&self) -> Result<(), MagnusError> {
@@ -477,10 +548,21 @@ impl Server {
                     task.await.unwrap_or_else(|e| warn!("Server task failed: {:?}", e));
                 }
             });
+
+            if let Some(syslog_runtime) = self.syslog_runtime.borrow().as_ref() {
+                // Release the GVL so worker threads can accept the messages the
+                // listeners have already framed.
+                nogvl(|| rt.block_on(syslog_runtime.drain(SYSLOG_DRAIN_TIMEOUT)));
+            }
+        }
+
+        if let Some(syslog_runtime) = self.syslog_runtime.borrow_mut().take() {
+            syslog_runtime.remove_socket_file();
         }
 
         // Drop the channel and runtime
         self.work_tx.borrow_mut().take();
+        self.syslog_work_tx.borrow_mut().take();
         self.runtime.borrow_mut().take();
         self.shutdown.borrow_mut().take();
 
@@ -502,6 +584,64 @@ impl Server {
         }
 
         Ok(())
+    }
+}
+
+// Take the next piece of work for a Ruby worker, preferring whatever is already
+// queued so we only release the GVL when both channels are empty. The fast path
+// checks requests first; syslog messages wait behind them, and their own
+// backpressure holds them rather than dropping them.
+fn next_work_item(
+    work_rx: &crossbeam_channel::Receiver<RequestWithCompletion>,
+    syslog_rx: &crossbeam_channel::Receiver<syslog::SyslogDelivery>,
+) -> Option<WorkItem> {
+    match work_rx.try_recv() {
+        Ok(request) => return Some(WorkItem::Http(request)),
+        Err(crossbeam_channel::TryRecvError::Disconnected) => return None,
+        Err(crossbeam_channel::TryRecvError::Empty) => (),
+    }
+
+    match syslog_rx.try_recv() {
+        Ok(delivery) => return Some(WorkItem::Syslog(delivery)),
+        Err(crossbeam_channel::TryRecvError::Disconnected) => return None,
+        Err(crossbeam_channel::TryRecvError::Empty) => (),
+    }
+
+    nogvl(|| {
+        crossbeam_channel::select! {
+            recv(work_rx) -> request => request.ok().map(WorkItem::Http),
+            recv(syslog_rx) -> delivery => delivery.ok().map(WorkItem::Syslog),
+        }
+    })
+}
+
+// Hand one syslog message to the configured handler; anything other than a
+// truthy result means the message was not admitted.
+fn call_syslog_handler(handler: Option<Value>, delivery: &syslog::SyslogDelivery) -> bool {
+    let Some(handler) = handler else {
+        error!("Syslog message received but no syslog_handler is configured - refusing");
+        return false;
+    };
+
+    // Stream frames are validated during framing; datagrams stay binary.
+    let message = match std::str::from_utf8(&delivery.message) {
+        Ok(text) if delivery.utf8 => RString::new(text),
+        _ => RString::from_slice(&delivery.message),
+    };
+
+    let args = (
+        message,
+        RString::new(&delivery.peer),
+        delivery.transport.symbol(),
+        delivery.received_at_ns,
+    );
+
+    match handler.funcall::<_, _, Value>("call", args) {
+        Ok(result) => result.to_bool(),
+        Err(e) => {
+            error!("Syslog handler raised {:?} - treating the message as refused", e);
+            false
+        }
     }
 }
 
@@ -694,6 +834,8 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     server_class.define_method("stop", method!(Server::stop, 0))?;
     server_class.define_method("run_worker", method!(Server::run_worker, 0))?;
     server_class.define_method("total_connections", method!(Server::total_connections, 0))?;
+    server_class.define_method("syslog_listening?", method!(Server::syslog_listening, 0))?;
+    server_class.define_method("syslog_stats", method!(Server::syslog_stats, 0))?;
 
     let response_class = module.define_class("Response", ruby.class_object())?;
     response_class.define_singleton_method("new", function!(Response::new, 3))?;

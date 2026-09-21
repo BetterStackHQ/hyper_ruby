@@ -3,7 +3,7 @@ name = "hyper_ruby"
 version = "0.1.0"
 edition = "2021"
 authors = ["alistairjevans <alistair@betterstack.com>"]
-license = "MIT"
+license = "MIT AND MPL-2.0"
 publish = false
 
 [lib]

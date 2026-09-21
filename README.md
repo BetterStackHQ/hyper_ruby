@@ -13,8 +13,9 @@ To install this gem onto your local machine, run `bundle exec rake install`. To 
 ## Syslog listeners
 
 Alongside HTTP, the server can accept syslog over a stream socket (Unix socket
-or TCP, optionally behind a PROXY v2 header) and over UDP, handing each complete
-message to a configured Ruby callable on the same worker threads. See the
+or TCP, optionally behind a PROXY v2 header) and over UDP. Each complete message
+is yielded to the same `Server#run_worker` block as requests, as a
+`HyperRuby::SyslogMessage` the block answers with an admission verdict. See the
 configuration keys documented at the top of `lib/hyper_ruby.rb`.
 
 ## License

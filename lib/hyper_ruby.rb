@@ -37,7 +37,9 @@ require_relative "hyper_ruby/hyper_ruby"
 #
 # A truthy return means the message was admitted; anything else, or a raised
 # exception, means it was refused: a stream connection holds the message and
-# retries it while its reads stall, a datagram is dropped and counted.
+# retries it while its reads stall, a datagram is dropped and counted. Returning
+# a Response for a syslog message is not a verdict: it is logged and the message
+# is refused.
 #
 # Server#syslog_listening? reports listener readiness, and Server#syslog_stats
 # returns the transport counters.

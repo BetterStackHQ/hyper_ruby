@@ -84,15 +84,63 @@ class TestSyslog < HyperRubyTest
     delivered = seen.pop
     assert_equal HyperRuby::SyslogMessage, delivered[:class]
     assert_equal "<13>typed", delivered[:message]
-    assert_match(/HyperRuby::SyslogMessage transport=Stream/, delivered[:inspect])
+    assert_match(/HyperRuby::SyslogMessage transport=:stream/, delivered[:inspect])
+  end
+
+  def test_messages_survive_garbage_collection
+    kept = Queue.new
+    handler = lambda do |syslog|
+      kept << syslog
+      true
+    end
+
+    with_syslog_server(syslog_config(stream: true), handler) do |server|
+      connect_stream(server) do |socket|
+        GC.stress = true
+        begin
+          3.times { |i| socket.write("<13>collected #{i}\n") }
+          socket.flush
+          wait_until(timeout: 30) { kept.size == 3 }
+        ensure
+          GC.stress = false
+        end
+      end
+
+      assert_equal 3, server.syslog_stats[:messages_delivered]
+    end
+
+    # The objects outlive the worker call that yielded them.
+    GC.start(full_mark: true, immediate_sweep: true)
+    GC.compact
+
+    messages = Array.new(kept.size) { kept.pop }
+    assert_equal ["<13>collected 0", "<13>collected 1", "<13>collected 2"],
+                 messages.map(&:message)
+    assert_equal [:stream, :stream, :stream], messages.map(&:transport)
+    assert_equal [1, 1, 1], messages.map(&:attempt)
+    assert_equal ["127.0.0.1"] * 3, messages.map(&:peer_ip)
+    assert messages.map(&:message_id).all?(&:positive?)
+  end
+
+  def test_returning_a_response_for_a_syslog_message_refuses_it
+    handler = lambda do |_syslog|
+      HyperRuby::Response.new(200, {}, "")
+    end
+
+    with_syslog_server(syslog_config(udp: true), handler) do |server|
+      send_datagram(server, "<13>answered with a response")
+      wait_until { server.syslog_stats[:udp_dropped] == 1 }
+
+      stats = server.syslog_stats
+      assert_equal 1, stats[:handler_errors]
+      assert_equal 0, stats[:messages_delivered]
+      assert_equal 0, stats[:deliveries_refused]
+    end
   end
 
   def test_octet_counted_and_newline_frames
     with_syslog_server(syslog_config(stream: true), @collector.handler) do |server|
       before = Time.now.to_f * 1_000_000_000
-      # The handler must survive collection between configuration and delivery.
-      GC.start(full_mark: true, immediate_sweep: true)
-
       connect_stream(server) do |socket|
         socket.write("11 hello there")
         socket.write("<13>a newline frame\n")

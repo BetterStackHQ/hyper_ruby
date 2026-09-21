@@ -18,7 +18,7 @@ use crossbeam_channel::TrySendError;
 use log::{debug, info, warn};
 use magnus::{
     value::{qnil, ReprValue},
-    Error as MagnusError, RHash, RString, Symbol, TryConvert, Value,
+    DataTypeFunctions, Error as MagnusError, RHash, RString, Symbol, TryConvert, TypedData, Value,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -54,11 +54,15 @@ pub(crate) enum Transport {
 }
 
 impl Transport {
-    pub(crate) fn symbol(self) -> Symbol {
+    pub(crate) fn name(self) -> &'static str {
         match self {
-            Transport::Stream => Symbol::new("stream"),
-            Transport::Datagram => Symbol::new("datagram"),
+            Transport::Stream => "stream",
+            Transport::Datagram => "datagram",
         }
+    }
+
+    pub(crate) fn symbol(self) -> Symbol {
+        Symbol::new(self.name())
     }
 }
 
@@ -250,8 +254,10 @@ impl SyslogDelivery {
     }
 }
 
-/// One syslog message, as the worker block sees it.
-#[magnus::wrap(class = "HyperRuby::SyslogMessage")]
+/// One syslog message, as the worker block sees it. Freed as soon as it is
+/// collected, and its payload is reported to the GC, as for a request.
+#[derive(TypedData)]
+#[magnus(class = "HyperRuby::SyslogMessage", free_immediately, size)]
 pub(crate) struct SyslogMessage {
     bytes: Bytes,
     /// Stream frames are validated UTF-8; datagrams stay binary.
@@ -265,12 +271,25 @@ pub(crate) struct SyslogMessage {
     attempt: u32,
 }
 
+impl DataTypeFunctions for SyslogMessage {
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self) + self.bytes.len()
+    }
+}
+
 impl SyslogMessage {
     pub(crate) fn message(&self) -> RString {
-        match std::str::from_utf8(&self.bytes) {
-            Ok(text) if self.utf8 => RString::new(text),
-            _ => RString::from_slice(&self.bytes),
+        if self.utf8 {
+            // Stream frames are validated while they are framed, so this needs
+            // no second pass over the bytes.
+            unsafe { RString::new(std::str::from_utf8_unchecked(&self.bytes)) }
+        } else {
+            RString::from_slice(&self.bytes)
         }
+    }
+
+    pub(crate) fn transport_name(&self) -> &'static str {
+        self.transport.name()
     }
 
     pub(crate) fn peer_ip(&self) -> Value {
@@ -298,8 +317,8 @@ impl SyslogMessage {
 
     pub(crate) fn inspect(&self) -> RString {
         RString::new(&format!(
-            "#<HyperRuby::SyslogMessage transport={:?} bytes={} message_id={} attempt={}>",
-            self.transport,
+            "#<HyperRuby::SyslogMessage transport=:{} bytes={} message_id={} attempt={}>",
+            self.transport.name(),
             self.bytes.len(),
             self.message_id,
             self.attempt

@@ -693,17 +693,41 @@ fn try_syslog_work_item(syslog_rx: &crossbeam_channel::Receiver<syslog::SyslogDe
     }
 }
 
+static SYSLOG_RESPONSE_WARNING: Once = Once::new();
+
 // Hand one syslog message to the worker block; anything other than a truthy
 // result means the message was not admitted.
 fn call_block_with_syslog_message(
     block: &magnus::block::Proc,
     message: syslog::SyslogMessage,
 ) -> syslog::HandlerResult {
+    let message_id = message.message_id();
+    let transport = message.transport_name();
+
     match block.call::<_, Value>([message.into_value()]) {
-        Ok(result) if result.to_bool() => syslog::HandlerResult::Accepted,
-        Ok(_) => syslog::HandlerResult::Refused,
+        Ok(result) => {
+            // A response is an answer to a request, not a verdict on a syslog
+            // message, and must not be read as one.
+            if Obj::<Response>::try_convert(result).is_ok()
+                || Obj::<GrpcResponse>::try_convert(result).is_ok()
+            {
+                SYSLOG_RESPONSE_WARNING.call_once(|| {
+                    error!("Block returned a response for a syslog message - a syslog message is answered with an admission verdict, so the message is being refused");
+                });
+                return syslog::HandlerResult::Failed;
+            }
+
+            if result.to_bool() {
+                syslog::HandlerResult::Accepted
+            } else {
+                syslog::HandlerResult::Refused
+            }
+        }
         Err(e) => {
-            error!("Block call failed with error: {:?} - treating the message as refused", e);
+            error!(
+                "Block call failed with error: {:?} - refusing {} syslog message {}",
+                e, transport, message_id
+            );
             syslog::HandlerResult::Failed
         }
     }

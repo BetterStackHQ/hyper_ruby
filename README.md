@@ -23,7 +23,8 @@ The gem is available as open source under the terms of the [MIT License](https:/
 
 `ext/hyper_ruby/src/syslog/framing.rs` is an exception: it is a port of
 Vector 0.48.0's `lib/codecs/src/decoding/framing/octet_counting.rs` and is
-licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/en-US/MPL/2.0/).
+licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/en-US/MPL/2.0/),
+which is why the gem's metadata lists both licences.
 
 ## Code of Conduct
 

@@ -11,7 +11,7 @@ Gem::Specification.new do |spec|
   spec.summary = "Hyper-backed ruby web server"
   spec.description = "Hyper-backed ruby web server"
   spec.homepage = "https://github.com/betterstack/hyper-ruby"
-  spec.license = "MIT"
+  spec.licenses = ["MIT", "MPL-2.0"]
   spec.required_ruby_version = ">= 3.0.0"
   spec.required_rubygems_version = ">= 3.3.11"
 

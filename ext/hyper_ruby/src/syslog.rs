@@ -16,7 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::TrySendError;
 use log::{debug, info, warn};
-use magnus::{Error as MagnusError, RHash, Symbol, TryConvert};
+use magnus::{
+    value::{qnil, ReprValue},
+    Error as MagnusError, RHash, RString, Symbol, TryConvert, Value,
+};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, UdpSocket, UnixListener};
@@ -235,17 +238,73 @@ impl SyslogCounters {
 
 /// A complete message on its way to a Ruby worker thread.
 pub(crate) struct SyslogDelivery {
-    pub message: Bytes,
-    /// Stream frames are validated UTF-8; datagrams are handed over as binary.
-    pub utf8: bool,
+    message: SyslogMessage,
+    result_tx: oneshot::Sender<HandlerResult>,
+}
+
+impl SyslogDelivery {
+    /// Split into the object handed to the worker block and the channel its
+    /// verdict goes back on.
+    pub(crate) fn into_parts(self) -> (SyslogMessage, oneshot::Sender<HandlerResult>) {
+        (self.message, self.result_tx)
+    }
+}
+
+/// One syslog message, as the worker block sees it.
+#[magnus::wrap(class = "HyperRuby::SyslogMessage")]
+pub(crate) struct SyslogMessage {
+    bytes: Bytes,
+    /// Stream frames are validated UTF-8; datagrams stay binary.
+    utf8: bool,
     /// Absent when the transport names no peer, such as a Unix socket
     /// connection without a PROXY header.
-    pub peer: Option<Arc<str>>,
-    pub transport: Transport,
-    pub received_at_ns: u64,
-    pub message_id: u64,
-    pub attempt: u32,
-    pub result_tx: oneshot::Sender<HandlerResult>,
+    peer: Option<Arc<str>>,
+    transport: Transport,
+    received_at_ns: u64,
+    message_id: u64,
+    attempt: u32,
+}
+
+impl SyslogMessage {
+    pub(crate) fn message(&self) -> RString {
+        match std::str::from_utf8(&self.bytes) {
+            Ok(text) if self.utf8 => RString::new(text),
+            _ => RString::from_slice(&self.bytes),
+        }
+    }
+
+    pub(crate) fn peer_ip(&self) -> Value {
+        match &self.peer {
+            Some(peer) => RString::new(peer).as_value(),
+            None => qnil().as_value(),
+        }
+    }
+
+    pub(crate) fn transport(&self) -> Symbol {
+        self.transport.symbol()
+    }
+
+    pub(crate) fn received_at_ns(&self) -> u64 {
+        self.received_at_ns
+    }
+
+    pub(crate) fn message_id(&self) -> u64 {
+        self.message_id
+    }
+
+    pub(crate) fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub(crate) fn inspect(&self) -> RString {
+        RString::new(&format!(
+            "#<HyperRuby::SyslogMessage transport={:?} bytes={} message_id={} attempt={}>",
+            self.transport,
+            self.bytes.len(),
+            self.message_id,
+            self.attempt
+        ))
+    }
 }
 
 enum DeliveryOutcome {
@@ -269,13 +328,15 @@ impl Dispatcher {
     async fn deliver(&self, pending: &PendingMessage, attempt: u32) -> DeliveryOutcome {
         let (result_tx, result_rx) = oneshot::channel();
         let mut delivery = SyslogDelivery {
-            message: pending.message.clone(),
-            utf8: pending.utf8,
-            peer: pending.peer.clone(),
-            transport: pending.transport,
-            received_at_ns: pending.received_at_ns,
-            message_id: pending.message_id,
-            attempt,
+            message: SyslogMessage {
+                bytes: pending.message.clone(),
+                utf8: pending.utf8,
+                peer: pending.peer.clone(),
+                transport: pending.transport,
+                received_at_ns: pending.received_at_ns,
+                message_id: pending.message_id,
+                attempt,
+            },
             result_tx,
         };
 

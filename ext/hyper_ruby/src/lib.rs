@@ -11,7 +11,7 @@ use gvl_helpers::nogvl;
 
 use magnus::block::block_proc;
 use magnus::typed_data::Obj;
-use magnus::{function, method, prelude::*, value::Opaque, Error as MagnusError, IntoValue, RHash, Ruby, Value, RString};
+use magnus::{function, method, prelude::*, Error as MagnusError, IntoValue, RHash, Ruby, Value, RString};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -133,7 +133,6 @@ struct Server {
     socket_ident: RefCell<Option<(u64, u64)>>,
     syslog_work_rx: RefCell<Option<crossbeam_channel::Receiver<syslog::SyslogDelivery>>>,
     syslog_work_tx: RefCell<Option<Arc<crossbeam_channel::Sender<syslog::SyslogDelivery>>>>,
-    syslog_handler: RefCell<Option<Opaque<Value>>>,
     syslog_counters: Arc<syslog::SyslogCounters>,
     syslog_runtime: RefCell<Option<syslog::SyslogRuntime>>,
 }
@@ -152,7 +151,6 @@ impl Server {
             socket_ident: RefCell::new(None),
             syslog_work_rx: RefCell::new(None),
             syslog_work_tx: RefCell::new(None),
-            syslog_handler: RefCell::new(None),
             syslog_counters: Arc::new(syslog::SyslogCounters::default()),
             syslog_runtime: RefCell::new(None),
         }
@@ -162,8 +160,8 @@ impl Server {
         self.total_connections.load(Ordering::Relaxed)
     }
 
-    pub fn configure(rb_self: Obj<Self>, config: magnus::RHash) -> Result<(), MagnusError> {
-        let mut server_config = rb_self.config.borrow_mut();
+    pub fn configure(&self, config: magnus::RHash) -> Result<(), MagnusError> {
+        let mut server_config = self.config.borrow_mut();
         if let Some(bind_address) = config.get(magnus::Symbol::new("bind_address")) {
             server_config.bind_address = String::try_convert(bind_address)?;
         }
@@ -194,13 +192,6 @@ impl Server {
 
         server_config.syslog.apply(&config)?;
 
-        if let Some(handler) = config.get(magnus::Symbol::new("syslog_handler")) {
-            // Worker threads hold no other reference to the handler, so keep it
-            // reachable through the server object they are running for.
-            rb_self.ivar_set("@syslog_handler", handler)?;
-            *rb_self.syslog_handler.borrow_mut() = Some(Opaque::from(handler));
-        }
-
         // Initialize logging if not already initialized
         LOGGER_INIT.call_once(|| {
             let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
@@ -223,9 +214,6 @@ impl Server {
     // Method that Ruby worker threads will call with a block
     pub fn run_worker(&self) -> Result<(), MagnusError> {
         let block = block_proc().unwrap();
-        let ruby = Ruby::get().map_err(|e| {
-            MagnusError::new(magnus::exception::runtime_error(), format!("Workers must run on a Ruby thread: {:?}", e))
-        })?;
 
         // Check if we have a work_rx channel, error out if not
         let work_rx = self.work_rx.borrow().as_ref().ok_or_else(|| {
@@ -236,7 +224,6 @@ impl Server {
             MagnusError::new(magnus::exception::runtime_error(), "Server must be started before running workers")
         })?.clone();
 
-        let syslog_handler = self.syslog_handler.borrow().map(|handler| ruby.get_inner(handler));
         let (syslog_enabled, work_ratio) = {
             let config = self.config.borrow();
             (config.syslog.enabled(), config.syslog.work_ratio)
@@ -306,8 +293,9 @@ impl Server {
                     }
                 }
                 WorkItem::Syslog(delivery) => {
-                    let result = call_syslog_handler(syslog_handler, &delivery);
-                    if delivery.result_tx.send(result).is_err() {
+                    let (message, result_tx) = delivery.into_parts();
+                    let result = call_block_with_syslog_message(&block, message);
+                    if result_tx.send(result).is_err() {
                         debug!("Syslog listener stopped waiting for an admission result");
                     }
                 }
@@ -705,42 +693,17 @@ fn try_syslog_work_item(syslog_rx: &crossbeam_channel::Receiver<syslog::SyslogDe
     }
 }
 
-// Hand one syslog message to the configured handler; anything other than a
-// truthy result means the message was not admitted.
-fn call_syslog_handler(
-    handler: Option<Value>,
-    delivery: &syslog::SyslogDelivery,
+// Hand one syslog message to the worker block; anything other than a truthy
+// result means the message was not admitted.
+fn call_block_with_syslog_message(
+    block: &magnus::block::Proc,
+    message: syslog::SyslogMessage,
 ) -> syslog::HandlerResult {
-    let Some(handler) = handler else {
-        error!("Syslog message received but no syslog_handler is configured - refusing");
-        return syslog::HandlerResult::Refused;
-    };
-
-    // Stream frames are validated during framing; datagrams stay binary.
-    let message = match std::str::from_utf8(&delivery.message) {
-        Ok(text) if delivery.utf8 => RString::new(text),
-        _ => RString::from_slice(&delivery.message),
-    };
-
-    let peer = match &delivery.peer {
-        Some(peer) => RString::new(peer).as_value(),
-        None => magnus::value::qnil().as_value(),
-    };
-
-    let args = (
-        message,
-        peer,
-        delivery.transport.symbol(),
-        delivery.received_at_ns,
-        delivery.message_id,
-        delivery.attempt,
-    );
-
-    match handler.funcall::<_, _, Value>("call", args) {
+    match block.call::<_, Value>([message.into_value()]) {
         Ok(result) if result.to_bool() => syslog::HandlerResult::Accepted,
         Ok(_) => syslog::HandlerResult::Refused,
         Err(e) => {
-            error!("Syslog handler raised {:?} - treating the message as refused", e);
+            error!("Block call failed with error: {:?} - treating the message as refused", e);
             syslog::HandlerResult::Failed
         }
     }
@@ -950,6 +913,15 @@ fn init(ruby: &Ruby) -> Result<(), MagnusError> {
     grpc_response_class.define_method("status", method!(GrpcResponse::status, 0))?;
     grpc_response_class.define_method("headers", method!(GrpcResponse::headers, 0))?;
     grpc_response_class.define_method("body", method!(GrpcResponse::body, 0))?;
+
+    let syslog_message_class = module.define_class("SyslogMessage", ruby.class_object())?;
+    syslog_message_class.define_method("message", method!(syslog::SyslogMessage::message, 0))?;
+    syslog_message_class.define_method("peer_ip", method!(syslog::SyslogMessage::peer_ip, 0))?;
+    syslog_message_class.define_method("transport", method!(syslog::SyslogMessage::transport, 0))?;
+    syslog_message_class.define_method("received_at_ns", method!(syslog::SyslogMessage::received_at_ns, 0))?;
+    syslog_message_class.define_method("message_id", method!(syslog::SyslogMessage::message_id, 0))?;
+    syslog_message_class.define_method("attempt", method!(syslog::SyslogMessage::attempt, 0))?;
+    syslog_message_class.define_method("inspect", method!(syslog::SyslogMessage::inspect, 0))?;
 
     let request_class = module.define_class("Request", ruby.class_object())?;
     request_class.define_method("http_method", method!(Request::method, 0))?;

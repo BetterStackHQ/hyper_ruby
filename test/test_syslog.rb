@@ -28,17 +28,19 @@ class TestSyslog < HyperRubyTest
     end
 
     def handler
-      lambda do |message, peer, transport, received_at_ns, message_id, attempt|
+      lambda do |syslog|
         sleep(@delay) if @delay > 0
+        message = syslog.message
         @mutex.synchronize do
           @messages << {
-            message: message, peer: peer, transport: transport,
-            received_at_ns: received_at_ns, message_id: message_id, attempt: attempt
+            message: message, peer: syslog.peer_ip, transport: syslog.transport,
+            received_at_ns: syslog.received_at_ns, message_id: syslog.message_id,
+            attempt: syslog.attempt
           }
         end
 
         next false if @refuse_matching && message.include?(@refuse_matching)
-        next false if attempt < @accept_from_attempt
+        next false if syslog.attempt < @accept_from_attempt
 
         @accept
       end
@@ -63,6 +65,26 @@ class TestSyslog < HyperRubyTest
     def for_message(body)
       @mutex.synchronize { @messages.select { |m| m[:message] == body } }
     end
+  end
+
+  def test_worker_block_receives_a_syslog_message_object
+    seen = Queue.new
+    handler = lambda do |syslog|
+      seen << { class: syslog.class, inspect: syslog.inspect, message: syslog.message }
+      true
+    end
+
+    with_syslog_server(syslog_config(stream: true), handler) do |server|
+      connect_stream(server) do |socket|
+        socket.write("<13>typed\n")
+        wait_until { !seen.empty? }
+      end
+    end
+
+    delivered = seen.pop
+    assert_equal HyperRuby::SyslogMessage, delivered[:class]
+    assert_equal "<13>typed", delivered[:message]
+    assert_match(/HyperRuby::SyslogMessage transport=Stream/, delivered[:inspect])
   end
 
   def test_octet_counted_and_newline_frames
@@ -331,7 +353,7 @@ class TestSyslog < HyperRubyTest
       connect_stream(server) do |socket|
         socket.write("<13>retried\n")
         socket.write("<13>plain\n")
-        wait_until { @collector.bodies.include?("<13>plain") }
+        wait_until { server.syslog_stats[:messages_delivered] == 2 }
       end
 
       retried = @collector.for_message("<13>retried")
@@ -391,7 +413,7 @@ class TestSyslog < HyperRubyTest
 
   def test_handler_exception_refuses_the_message_and_counts_separately
     raised = Queue.new
-    handler = lambda do |*_args|
+    handler = lambda do |_syslog|
       raised << true
       raise "handler failure"
     end
